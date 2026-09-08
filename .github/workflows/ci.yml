@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Continuous integration: the four verifications CLAUDE.md asks for before handing over,
+# run on every push and every pull request, so that `main` is green by construction.
+#
+# This file is configuration, not code. It adds no crate and no dependency to the node, so
+# it needs no decision record under docs/decisions/. The two actions it uses are GitHub's
+# own (checkout, cache), pinned to a commit so that what runs is what was reviewed.
+#
+# Default workspace members only. `crates/differential` compiles Bitcoin Core's C++ script
+# verifier as a test oracle and runs on demand (`cargo test -p bitmigo-differential`);
+# whether it earns CI minutes is a later decision.
+#
+# The Rust version is read from the workspace's `rust-version` in Cargo.toml, so it is
+# pinned in exactly one place. `--locked` refuses a stale Cargo.lock instead of resolving.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artefacts are useless on a fresh runner and bloat the cache.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  verify:
+    name: build, test, clippy, fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Read the pinned Rust version and derive the cache key
+        id: rust
+        run: |
+          version="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+          test -n "$version" || { echo "no rust-version in Cargo.toml" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "cache-prefix=cargo-${RUNNER_OS}-${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust ${{ steps.rust.outputs.version }}
+        env:
+          RUST_VERSION: ${{ steps.rust.outputs.version }}
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal \
+            --component clippy --component rustfmt --no-self-update
+          rustup override set "$RUST_VERSION"
+          rustc --version
+          cargo --version
+
+      - name: Cache the cargo registry and the target directory
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.rust.outputs.cache-prefix }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ steps.rust.outputs.cache-prefix }}-
+
+      - name: cargo build
+        run: cargo build --locked
+
+      - name: cargo test
+        run: cargo test --locked
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
