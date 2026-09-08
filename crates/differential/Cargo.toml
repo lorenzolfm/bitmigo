@@ -1,0 +1,19 @@
+[package]
+name = "bitmigo-differential"
+description = "Differential tests of bitmigo's script interpreter against Bitcoin Core's verifier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+bitmigo-consensus.workspace = true
+bitcoin.workspace = true
+# The oracle. Never a dependency of `bitmigo-consensus` or `bitmigo`, never through
+# `bitcoin`'s feature of the same name (docs/decisions/0003-differential-oracle.md).
+bitcoinconsensus.workspace = true
+
+[lints]
+workspace = true

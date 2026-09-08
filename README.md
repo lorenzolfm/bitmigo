@@ -24,6 +24,8 @@ Rust 1.98 or newer.
 
 - `crates/consensus` — the rules, as a pure library with no I/O.
 - `crates/bitmigo` — the node binary.
+- `crates/differential` — differential tests against Bitcoin Core's script verifier; not
+  built by default, run with `cargo test -p bitmigo-differential` (needs a C++ compiler).
 - `docs/decisions/` — why things are the way they are.
 
 ## License

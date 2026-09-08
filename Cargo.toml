@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/consensus", "crates/bitmigo"]
+members = ["crates/consensus", "crates/bitmigo", "crates/differential"]
+# The differential crate is on demand only (`cargo test -p bitmigo-differential`): it builds
+# Bitcoin Core's C++ script verifier as a test oracle, which the node never links.
+default-members = ["crates/consensus", "crates/bitmigo"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,11 +15,11 @@ repository = "https://github.com/lorenzolfm/bitmigo"
 [workspace.dependencies]
 bitmigo-consensus = { path = "crates/consensus" }
 
-# The only third-party crates, pinned exactly. See docs/decisions/0001-primitive-crates.md
-# for why these three and why nothing else. `bitcoin` 0.32 itself depends on `hashes ^0.14`
-# and `secp256k1 ^0.29`, so the pins below are the versions it resolves to: one copy of each
-# crate in the tree, and the re-exports `bitcoin::hashes` / `bitcoin::secp256k1` name the
-# same types as the direct dependencies.
+# The only third-party crates the node links, pinned exactly. See
+# docs/decisions/0001-primitive-crates.md for why these three and why nothing else.
+# `bitcoin` 0.32 itself depends on `hashes ^0.14` and `secp256k1 ^0.29`, so the pins below
+# are the versions it resolves to: one copy of each crate in the tree, and the re-exports
+# `bitcoin::hashes` / `bitcoin::secp256k1` name the same types as the direct dependencies.
 #
 # Default features are off so that every enabled feature is a visible choice. In particular
 # `bitcoin/bitcoinconsensus` must never be enabled: the whole point of this repository is
@@ -24,6 +27,12 @@ bitmigo-consensus = { path = "crates/consensus" }
 bitcoin = { version = "=0.32.102", default-features = false, features = ["std"] }
 bitcoin_hashes = { version = "=0.14.101", default-features = false, features = ["std"] }
 secp256k1 = { version = "=0.29.1", default-features = false, features = ["std"] }
+
+# Test-only oracle for `crates/differential` and nothing else: Bitcoin Core 26.0's script
+# verifier, compiled from its C++ sources. The registry version is `0.106.0+26.0`; cargo
+# ignores build metadata in requirements, so the pin is spelled without it. See
+# docs/decisions/0003-differential-oracle.md.
+bitcoinconsensus = { version = "=0.106.0", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
