@@ -9,11 +9,14 @@
 //! can disagree with the network small enough to read. The clippy configuration beside this
 //! crate rejects the common ways of breaking that rule.
 //!
-//! The crate is empty for now. Rules land one at a time, each with its tests.
+//! Rules land one module at a time, each with its tests. [`params`] is the first: what a
+//! chain is, and which rules apply to a block at a height.
 
 // The purity tripwire in `clippy.toml` is a hard error here, not a warning like the rest of
 // clippy: reaching for the disk or the network from consensus is a design bug, not style.
 #![deny(clippy::disallowed_types, clippy::disallowed_methods)]
+
+pub mod params;
 
 #[cfg(test)]
 mod tests {
