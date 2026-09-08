@@ -5,14 +5,25 @@
 //! The count is a static scan, not an execution: every `CHECKSIG` in the script counts,
 //! whether or not a branch would ever reach it, and the scan stops silently at the first
 //! opcode that fails to parse, exactly as Core's does. The block rules add the counts of
-//! every script in a block and compare the total with `MAX_BLOCK_SIGOPS_COST`.
+//! every script in a block and compare the total with `MAX_BLOCK_SIGOPS_COST`: the legacy
+//! count at receipt, and once the coins are known [`p2sh_sigop_count`] over the redeem
+//! script and [`witness_sigop_count`] over the witness program (`GetTransactionSigOpCost`).
 
+use bitcoin::Witness;
+
+use super::ScriptFlags;
 use super::interpreter::MAX_PUBKEYS_PER_MULTISIG;
 use super::opcode::{
     OP_1, OP_16, OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY, OP_CHECKSIG, OP_CHECKSIGVERIFY,
     OP_INVALIDOPCODE, Opcode,
 };
 use super::reader::Reader;
+use super::verify::{is_pay_to_script_hash, witness_program};
+
+/// `WITNESS_V0_KEYHASH_SIZE`: a P2WPKH program, which costs one signature operation.
+const WITNESS_V0_KEYHASH_SIZE: usize = 20;
+/// `WITNESS_V0_SCRIPTHASH_SIZE`: a P2WSH program, which costs what its script does.
+const WITNESS_V0_SCRIPTHASH_SIZE: usize = 32;
 
 /// How a `CHECKMULTISIG` is counted: Core's `fAccurate`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,16 +71,97 @@ pub fn sigop_count(script: &[u8], mode: SigOpMode) -> u32 {
     count
 }
 
+/// Core's `GetP2SHSigOpCount` for one input: when `script_pubkey` is P2SH, the accurate
+/// count of the redeem script, being the last item `script_sig` pushes
+/// (`CScript::GetSigOpCount(scriptSig)`, BIP16); zero for any other output. A `scriptSig`
+/// that is not push-only counts zero, as does one whose last item is a small integer.
+#[must_use]
+pub fn p2sh_sigop_count(script_pubkey: &[u8], script_sig: &[u8]) -> u32 {
+    if !is_pay_to_script_hash(script_pubkey) {
+        return 0;
+    }
+    match last_push(script_sig) {
+        Some(redeem_script) => sigop_count(redeem_script, SigOpMode::Accurate),
+        None => 0,
+    }
+}
+
+/// Core's `CountWitnessSigOps`: the signature operations of the witness program an input
+/// spends, native or wrapped in P2SH (BIP141). Zero without the `WITNESS` flag, for a
+/// program of any version but 0, and for a P2SH input whose `scriptSig` is not push-only.
+#[must_use]
+pub fn witness_sigop_count(
+    script_sig: &[u8],
+    script_pubkey: &[u8],
+    witness: &Witness,
+    flags: ScriptFlags,
+) -> u32 {
+    if !flags.contains(ScriptFlags::WITNESS) {
+        return 0;
+    }
+    assert!(flags.contains(ScriptFlags::P2SH));
+    if let Some((version, program)) = witness_program(script_pubkey) {
+        return witness_program_sigop_count(version, program, witness);
+    }
+    if is_pay_to_script_hash(script_pubkey)
+        && let Some(redeem_script) = last_push(script_sig)
+        && let Some((version, program)) = witness_program(redeem_script)
+    {
+        return witness_program_sigop_count(version, program, witness);
+    }
+    0
+}
+
+/// Core's `WitnessSigOps`: one for P2WPKH; the accurate count of the witness script, the
+/// last witness item, for P2WSH; nothing for a missing witness or another version.
+fn witness_program_sigop_count(version: u8, program: &[u8], witness: &Witness) -> u32 {
+    assert!(program.len() >= 2);
+    assert!(program.len() <= 40);
+    if version != 0 {
+        return 0;
+    }
+    if program.len() == WITNESS_V0_KEYHASH_SIZE {
+        return 1;
+    }
+    if program.len() == WITNESS_V0_SCRIPTHASH_SIZE
+        && let Some(witness_script) = witness.last()
+    {
+        return sigop_count(witness_script, SigOpMode::Accurate);
+    }
+    0
+}
+
+/// The data of the last push in a push-only script: what a P2SH `scriptSig` leaves on top
+/// of the stack. `None` when an opcode above `OP_16` or a truncated push is met, where
+/// Core's `GetOp` loop gives up; `Some(&[])` when the last opcode is `OP_0` or `OP_1..OP_16`,
+/// whose "data" Core's `GetOp` clears.
+fn last_push(script_sig: &[u8]) -> Option<&[u8]> {
+    let mut last: &[u8] = &[];
+    let mut reader = Reader::new(script_sig);
+    // Every opcode consumes at least one byte, so the script length bounds the loop.
+    for _ in 0..=script_sig.len() {
+        let Some(read) = reader.next_op() else { break };
+        let Ok(op) = read else { return None };
+        if op.opcode.byte() > OP_16 {
+            return None;
+        }
+        last = op.push;
+    }
+    Some(last)
+}
+
 #[cfg(test)]
 mod tests {
     use bitcoin::Script;
 
+    use super::super::ScriptFlags;
     use super::super::opcode::{
         OP_0, OP_1, OP_CHECKMULTISIG, OP_CHECKMULTISIGVERIFY, OP_CHECKSIG, OP_CHECKSIGVERIFY,
         OP_DUP, OP_PUSHDATA1, OP_PUSHDATA2,
     };
+    use super::super::reader::push_encoding;
     use super::super::vectors::{CORE_SCRIPT_TESTS_JSON, Json, parse_script};
-    use super::{SigOpMode, sigop_count};
+    use super::{SigOpMode, p2sh_sigop_count, sigop_count, witness_sigop_count};
 
     const OP_2: u8 = OP_1 + 1;
     const OP_3: u8 = OP_1 + 2;
@@ -172,5 +264,103 @@ mod tests {
             }
         }
         assert!(compared > 2_000);
+    }
+
+    /// Core's `GetSigOpCount` test, the P2SH half: the redeem script is the last push of
+    /// the `scriptSig`, counted accurately; a `scriptSig` that is not push-only, or ends
+    /// in a small integer, reveals nothing; and a non-P2SH output is not this count's.
+    #[test]
+    fn p2sh_sigop_count_reads_the_redeem_script() {
+        use bitcoin::hashes::{Hash, hash160};
+        let dummy = [0u8; 20];
+        let mut s1 = vec![OP_1];
+        s1.extend(push_encoding(&dummy));
+        s1.extend(push_encoding(&dummy));
+        s1.extend([0x52, OP_CHECKMULTISIG, 0x63, OP_CHECKSIG, 0x68]);
+        assert_eq!(sigop_count(&s1, SigOpMode::Accurate), 3);
+        assert_eq!(sigop_count(&s1, SigOpMode::Inaccurate), 21);
+        let mut p2sh = vec![0xa9, 0x14];
+        p2sh.extend_from_slice(&hash160::Hash::hash(&s1).to_byte_array());
+        p2sh.push(0x87);
+        let mut script_sig = vec![0x00];
+        script_sig.extend(push_encoding(&s1));
+        assert_eq!(p2sh_sigop_count(&p2sh, &script_sig), 3);
+
+        let mut s2 = vec![OP_1];
+        for _ in 0..3 {
+            s2.extend(push_encoding(&[0x02; 33]));
+        }
+        s2.extend([0x53, OP_CHECKMULTISIG]);
+        assert_eq!(sigop_count(&s2, SigOpMode::Accurate), 3);
+        assert_eq!(sigop_count(&s2, SigOpMode::Inaccurate), 20);
+        let mut p2sh = vec![0xa9, 0x14];
+        p2sh.extend_from_slice(&hash160::Hash::hash(&s2).to_byte_array());
+        p2sh.push(0x87);
+        assert_eq!(sigop_count(&p2sh, SigOpMode::Accurate), 0);
+        let mut script_sig_2 = vec![OP_1];
+        script_sig_2.extend(push_encoding(&dummy));
+        script_sig_2.extend(push_encoding(&dummy));
+        script_sig_2.extend(push_encoding(&s2));
+        assert_eq!(p2sh_sigop_count(&p2sh, &script_sig_2), 3);
+
+        // Not push-only, ending in a small integer, truncated, or not P2SH at all.
+        let mut not_push_only = script_sig_2.clone();
+        not_push_only.push(OP_CHECKSIG);
+        assert_eq!(p2sh_sigop_count(&p2sh, &not_push_only), 0);
+        let mut ends_in_two = script_sig_2.clone();
+        ends_in_two.push(0x52);
+        assert_eq!(p2sh_sigop_count(&p2sh, &ends_in_two), 0);
+        let mut truncated = script_sig_2.clone();
+        truncated.pop();
+        assert_eq!(p2sh_sigop_count(&p2sh, &truncated), 0);
+        assert_eq!(p2sh_sigop_count(&s1, &script_sig), 0);
+    }
+
+    /// `CountWitnessSigOps`: nothing without `WITNESS`; one for P2WPKH; the accurate count
+    /// of the last witness item for P2WSH, nothing when there is no witness; the same
+    /// through a P2SH wrapper whose `scriptSig` is push-only; nothing for version 1.
+    #[test]
+    fn witness_sigop_count_reads_the_program_and_the_witness() {
+        use bitcoin::Witness;
+        use bitcoin::hashes::{Hash, hash160, sha256};
+        let flags = ScriptFlags::P2SH.union(ScriptFlags::WITNESS);
+        let mut p2wpkh = vec![0x00, 0x14];
+        p2wpkh.extend([0x33; 20]);
+        let empty = Witness::new();
+        assert_eq!(witness_sigop_count(&[], &p2wpkh, &empty, flags), 1);
+        assert_eq!(
+            witness_sigop_count(&[], &p2wpkh, &empty, ScriptFlags::P2SH),
+            0
+        );
+        let mut taproot = vec![OP_1, 0x20];
+        taproot.extend([0x33; 32]);
+        assert_eq!(witness_sigop_count(&[], &taproot, &empty, flags), 0);
+
+        let witness_script = vec![OP_CHECKSIG, OP_CHECKSIG, OP_CHECKSIGVERIFY];
+        let mut p2wsh = vec![0x00, 0x20];
+        p2wsh.extend_from_slice(&sha256::Hash::hash(&witness_script).to_byte_array());
+        let witness = Witness::from_slice(&[vec![0x01], witness_script.clone()]);
+        assert_eq!(witness_sigop_count(&[], &p2wsh, &witness, flags), 3);
+        assert_eq!(witness_sigop_count(&[], &p2wsh, &empty, flags), 0);
+
+        let mut wrapper = vec![0xa9, 0x14];
+        wrapper.extend_from_slice(&hash160::Hash::hash(&p2wsh).to_byte_array());
+        wrapper.push(0x87);
+        let script_sig = push_encoding(&p2wsh);
+        assert_eq!(
+            witness_sigop_count(&script_sig, &wrapper, &witness, flags),
+            3
+        );
+        let mut not_push_only = script_sig.clone();
+        not_push_only.push(OP_CHECKSIG);
+        assert_eq!(
+            witness_sigop_count(&not_push_only, &wrapper, &witness, flags),
+            0
+        );
+        assert_eq!(witness_sigop_count(&script_sig, &p2wsh, &witness, flags), 3);
+        assert_eq!(
+            witness_sigop_count(&script_sig, &witness_script, &witness, flags),
+            0
+        );
     }
 }

@@ -100,12 +100,14 @@ copyrightable in any meaningful sense; it is published under this repository's l
 ### `regtest-blocks.json`
 
 Seven full regtest blocks, read by the `block` module's tests as the oracle for
-`check_block` and `accept_block`: genesis; heights 1 and 2 (coinbase only, BIP34 heights in
-the one-byte encoding); height 102 (three segwit spends of a matured coinbase, four
-transactions, so the merkle tree has an odd inner level); height 103 (one `sendmany` to a
-legacy and a P2SH-P2WPKH address); height 104 (a legacy spend with no witness and a
-P2SH-P2WPKH spend with `nLockTime = 103`, `nSequence = 0xfffffffe`); height 105 (coinbase
-only). Mined by `bitcoind -regtest` v31.1.0 with a fresh descriptor wallet, no mock time:
+`check_block` and `accept_block`, and for the coins path (`populate`, `confirm`, `connect`),
+which every block from height 1 passes against a coin store built from the earlier ones:
+genesis; heights 1 and 2 (coinbase only, BIP34 heights in the one-byte encoding); height 102
+(three segwit spends chained inside the block: the height-1 coinbase, then its change, then
+that change again, four transactions, so the merkle tree has an odd inner level); height 103
+(one `sendmany` to a legacy and a P2SH-P2WPKH address); height 104 (a legacy spend with no
+witness and a P2SH-P2WPKH spend with `nLockTime = 103`, `nSequence = 0xfffffffe`); height
+105 (coinbase only). Mined by `bitcoind -regtest` v31.1.0 with a fresh descriptor wallet, no mock time:
 
 ```
 bitcoin-cli -regtest generatetoaddress 101 <bech32 address>

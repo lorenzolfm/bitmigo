@@ -18,6 +18,31 @@ use super::{ChainParams, Height, ScriptFlags};
 /// block on could duplicate one (§2.5).
 pub const BIP34_IMPLIES_BIP30_LIMIT: Height = Height::new(1_983_702);
 
+/// Core's `COIN`: satoshis per bitcoin.
+const COIN: u64 = 100_000_000;
+
+/// Core's `GetBlockSubsidy` stops halving here, because shifting a 64-bit amount by 64 is
+/// undefined; the subsidy is zero from then on (§2.7).
+const HALVINGS_MAX: u32 = 64;
+
+/// What the coins path does about BIP30, the rule that no output of a block may already
+/// exist unspent in the UTXO set (§2.5). Three states, because Core has three: the scan,
+/// the scan skipped, and the two 2010 blocks whose coinbases overwrite an earlier coin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Bip30 {
+    /// Every output of the block must be absent from the set: the node looks each one up
+    /// and `confirm` rejects the block (`bad-txns-BIP30`) if any is found.
+    Enforce,
+    /// Core skips the scan: mainnet from the block after BIP34's until
+    /// [`BIP34_IMPLIES_BIP30_LIMIT`]. The node does not look, and `confirm` asserts it
+    /// found nothing, because Core would crash on an overwrite here.
+    Skip,
+    /// Mainnet 91842 and 91880: the node looks as for `Enforce`, and what it finds is the
+    /// coin the coinbase overwrites, carried in the delta so the set and its hash can
+    /// follow Core's.
+    Overwrite,
+}
+
 /// The flags Core applies to every block before the exception list and the buried heights
 /// are consulted (`GetBlockScriptFlags`, §4.2).
 pub(super) const ALWAYS_ON_SCRIPT_FLAGS: ScriptFlags = ScriptFlags::P2SH
@@ -39,7 +64,8 @@ pub struct Rules {
     bip34_active: bool,
     csv_active: bool,
     segwit_active: bool,
-    bip30_check_required: bool,
+    bip30: Bip30,
+    subsidy: u64,
 }
 
 impl Rules {
@@ -75,13 +101,42 @@ impl Rules {
         self.segwit_active
     }
 
+    /// What the coins path does about BIP30 for this block.
+    #[must_use]
+    pub fn bip30(&self) -> Bip30 {
+        self.bip30
+    }
+
     /// The coins path must reject any output that already exists in the UTXO set (BIP30).
     /// False only where Core skips the scan: the two 2010 repeat blocks, and the mainnet
     /// window from the block after BIP34's until [`BIP34_IMPLIES_BIP30_LIMIT`].
     #[must_use]
     pub fn bip30_check_required(&self) -> bool {
-        self.bip30_check_required
+        self.bip30 == Bip30::Enforce
     }
+
+    /// The block subsidy at this height, satoshis: what the coinbase may pay on top of the
+    /// fees (§2.7). Not a rule switch, but the one amount validation reads, kept here so
+    /// the coins path needs nothing beyond the `Context`.
+    #[must_use]
+    pub fn subsidy(&self) -> u64 {
+        self.subsidy
+    }
+}
+
+/// Core's `GetBlockSubsidy`: 50 BTC halved once per `halving_interval` blocks, zero after
+/// [`HALVINGS_MAX`] halvings (§2.7).
+#[must_use]
+pub fn block_subsidy(height: Height, halving_interval: u32) -> u64 {
+    assert!(halving_interval > 0);
+    // Floor division: every block of a period pays the same.
+    let halvings = height.get() / halving_interval;
+    if halvings >= HALVINGS_MAX {
+        return 0;
+    }
+    let subsidy = (50 * COIN) >> halvings;
+    assert!(subsidy <= 50 * COIN);
+    subsidy
 }
 
 impl ChainParams {
@@ -124,7 +179,8 @@ impl ChainParams {
             bip34_active: height >= buried.bip34.height,
             csv_active: height >= buried.csv,
             segwit_active: height >= buried.segwit,
-            bip30_check_required: self.bip30_check_required_at(height, hash, bip34_ancestor),
+            bip30: self.bip30_at(height, hash, bip34_ancestor),
+            subsidy: block_subsidy(height, self.halving_interval),
         };
 
         // Each derived field is paired with the flag it came from. BIP34 only implies the
@@ -184,13 +240,14 @@ impl ChainParams {
 
     /// Core's `ConnectBlock`: `fEnforceBIP30 = !IsBIP30Repeat(block)`, then cleared when the
     /// ancestor at the BIP34 height is the BIP34 block, then forced back on from
-    /// [`BIP34_IMPLIES_BIP30_LIMIT`].
-    fn bip30_check_required_at(
+    /// [`BIP34_IMPLIES_BIP30_LIMIT`]. A repeat block is the one case where the scan is off
+    /// and a coin does get overwritten.
+    fn bip30_at(
         &self,
         height: Height,
         hash: BlockHash,
         bip34_ancestor: Option<BlockHash>,
-    ) -> bool {
+    ) -> Bip30 {
         let bytes = hash.to_byte_array();
         let mut is_repeat_exception = false;
         // Bounded by the constructor: at most BIP30_REPEAT_EXCEPTIONS_MAX entries.
@@ -208,8 +265,16 @@ impl ChainParams {
             assert!(height > self.buried.bip34.height);
         }
 
-        let enforce = !is_repeat_exception && !bip34_block_is_ancestor;
-        enforce || height >= BIP34_IMPLIES_BIP30_LIMIT
+        if is_repeat_exception {
+            // Both repeat blocks predate BIP34, let alone the limit.
+            assert!(!bip34_block_is_ancestor);
+            assert!(height < BIP34_IMPLIES_BIP30_LIMIT);
+            return Bip30::Overwrite;
+        }
+        if bip34_block_is_ancestor && height < BIP34_IMPLIES_BIP30_LIMIT {
+            return Bip30::Skip;
+        }
+        Bip30::Enforce
     }
 }
 
@@ -219,7 +284,7 @@ mod tests {
     use bitcoin::hashes::Hash;
 
     use super::super::{ChainParams, Height, RegtestOverrides, ScriptFlags};
-    use super::BIP34_IMPLIES_BIP30_LIMIT;
+    use super::{BIP34_IMPLIES_BIP30_LIMIT, Bip30, COIN, HALVINGS_MAX, block_subsidy};
 
     fn hash(hex: &str) -> BlockHash {
         hex.parse().unwrap()
@@ -380,6 +445,76 @@ mod tests {
         assert!(!required(BIP34_IMPLIES_BIP30_LIMIT.get() - 1, bip34));
         assert!(required(BIP34_IMPLIES_BIP30_LIMIT.get(), bip34));
         assert!(required(5_000_000, bip34));
+    }
+
+    /// The three states, at the heights that pick them: enforce before BIP34 and from the
+    /// limit on, skip in between on the BIP34 chain, overwrite at the two repeat blocks.
+    #[test]
+    fn bip30_has_three_states() {
+        let params = ChainParams::mainnet();
+        let bip34 = Some(hash(BIP34_BLOCK));
+        let at = |height: u32, block: BlockHash, ancestor: Option<BlockHash>| {
+            params
+                .rules_at(Height::new(height), block, ancestor)
+                .bip30()
+        };
+        assert_eq!(at(91_841, ordinary(), None), Bip30::Enforce);
+        assert_eq!(at(91_842, hash(BIP30_REPEAT_91842), None), Bip30::Overwrite);
+        assert_eq!(at(91_880, hash(BIP30_REPEAT_91880), None), Bip30::Overwrite);
+        assert_eq!(at(227_931, ordinary(), None), Bip30::Enforce);
+        assert_eq!(at(227_932, ordinary(), bip34), Bip30::Skip);
+        assert_eq!(at(227_932, ordinary(), Some(ordinary())), Bip30::Enforce);
+        assert_eq!(at(1_983_701, ordinary(), bip34), Bip30::Skip);
+        assert_eq!(at(1_983_702, ordinary(), bip34), Bip30::Enforce);
+        let regtest = ChainParams::regtest(RegtestOverrides::default());
+        assert_eq!(
+            regtest
+                .rules_at(Height::new(91_842), hash(BIP30_REPEAT_91842), None)
+                .bip30(),
+            Bip30::Enforce
+        );
+    }
+
+    /// Core's `TestBlockSubsidyHalvings` for mainnet, regtest and one more interval, and
+    /// `subsidy_limit_test`: the sum over the schedule is the 20,999,999.9769 BTC that will
+    /// ever exist.
+    #[test]
+    fn block_subsidy_halves_on_schedule_and_sums_below_max_money() {
+        for interval in [210_000, 150, 1_000] {
+            let initial = 50 * COIN;
+            let mut previous = initial * 2;
+            for halvings in 0..HALVINGS_MAX {
+                let subsidy = block_subsidy(Height::new(halvings * interval), interval);
+                assert!(subsidy <= initial);
+                assert_eq!(subsidy, previous / 2, "{interval} {halvings}");
+                previous = subsidy;
+            }
+            assert_eq!(
+                block_subsidy(Height::new(HALVINGS_MAX * interval), interval),
+                0
+            );
+        }
+        let mainnet = ChainParams::mainnet();
+        let mut sum: u64 = 0;
+        for height in (0..14_000_000).step_by(1_000) {
+            let subsidy = block_subsidy(Height::new(height), mainnet.halving_interval());
+            assert!(subsidy <= 50 * COIN);
+            sum += subsidy * 1_000;
+            assert!(sum <= 21_000_000 * COIN);
+        }
+        assert_eq!(sum, 2_099_999_997_690_000);
+        assert_eq!(
+            mainnet
+                .rules_at(Height::new(840_000), ordinary(), Some(hash(BIP34_BLOCK)))
+                .subsidy(),
+            312_500_000
+        );
+        assert_eq!(
+            ChainParams::regtest(RegtestOverrides::default())
+                .rules_at(Height::new(150), ordinary(), None)
+                .subsidy(),
+            25 * COIN
+        );
     }
 
     #[test]

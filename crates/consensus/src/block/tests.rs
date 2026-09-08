@@ -32,15 +32,15 @@ use crate::tx::{MAX_BLOCK_WEIGHT, MAX_MONEY, TxError};
 /// witnesses, then one more coinbase-only block.
 const REGTEST_BLOCKS_JSON: &str = include_str!("../../tests/data/regtest-blocks.json");
 
-struct Fixture {
-    height: u32,
-    hash: BlockHash,
-    block: Block,
-    previous_time: BlockTime,
-    previous_median_time_past: BlockTime,
+pub(super) struct Fixture {
+    pub(super) height: u32,
+    pub(super) hash: BlockHash,
+    pub(super) block: Block,
+    pub(super) previous_time: BlockTime,
+    pub(super) previous_median_time_past: BlockTime,
 }
 
-fn fixture() -> Vec<Fixture> {
+pub(super) fn fixture() -> Vec<Fixture> {
     let rows = Json::parse(REGTEST_BLOCKS_JSON);
     rows.as_array()
         .iter()
@@ -66,12 +66,12 @@ fn fixture() -> Vec<Fixture> {
         .collect()
 }
 
-fn regtest() -> ChainParams {
+pub(super) fn regtest() -> ChainParams {
     ChainParams::regtest(RegtestOverrides::default())
 }
 
 /// The context the node would build for `row`'s block on `params`, at `height`.
-fn context_at(params: &ChainParams, row: &Fixture, height: u32) -> Context {
+pub(super) fn context_at(params: &ChainParams, row: &Fixture, height: u32) -> Context {
     let height = Height::new(height);
     Context::new(
         height,
@@ -82,13 +82,13 @@ fn context_at(params: &ChainParams, row: &Fixture, height: u32) -> Context {
     )
 }
 
-fn context(params: &ChainParams, row: &Fixture) -> Context {
+pub(super) fn context(params: &ChainParams, row: &Fixture) -> Context {
     context_at(params, row, row.height)
 }
 
 /// Regtest's target lets about half of all hashes through, so a mutated header needs a
 /// few nonces before it passes `check_header` again.
-fn mine(block: &mut Block, params: &ChainParams) {
+pub(super) fn mine(block: &mut Block, params: &ChainParams) {
     for nonce in 0..10_000u32 {
         block.header.nonce = nonce;
         if check_header(&block.header, params).is_ok() {
@@ -100,7 +100,7 @@ fn mine(block: &mut Block, params: &ChainParams) {
 
 /// Rewrites the header's merkle root from the transactions, using rust-bitcoin's tree as
 /// the oracle, and mines the header.
-fn seal(block: &mut Block, params: &ChainParams) {
+pub(super) fn seal(block: &mut Block, params: &ChainParams) {
     block.header.merkle_root = block.compute_merkle_root().unwrap();
     mine(block, params);
 }

@@ -13,8 +13,10 @@
 //! which rules apply to a block at a height; [`script`] is the script interpreter, from the
 //! signature hashes up to `verify_script`; [`header`] is proof of work, retargeting and the
 //! two header stages, `check_header` and `accept_header`, over the shared `Context`; [`tx`]
-//! is `check_tx` and finality; [`block`] is the two receipt-time block stages, `check_block`
-//! and `accept_block`, over the same `Context`.
+//! is `check_tx` and finality, then the rules that read a transaction's coins; [`block`] is
+//! the two receipt-time block stages, `check_block` and `accept_block`, and the coins path
+//! that runs in chain order, `populate`, `confirm` and `connect`, producing the `BlockDelta`
+//! storage applies, all over the same `Context`.
 
 // The purity tripwire in `clippy.toml` is a hard error here, not a warning like the rest of
 // clippy: reaching for the disk or the network from consensus is a design bug, not style.

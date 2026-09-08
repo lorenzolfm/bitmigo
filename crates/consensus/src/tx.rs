@@ -1,19 +1,24 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Transaction rules that need no coins: Core's `CheckTransaction` as [`check_tx`], the
-//! finality predicate `IsFinalTx` as [`is_final`], the legacy signature operation count, and
-//! the constants the block rules share with them (§2.1, §2.2, §2.3, §3.1).
-//!
-//! Everything here is a function of one transaction and, for finality, the height and time
-//! the containing block supplies. The rules that read the coins a transaction spends
-//! (amounts, maturity, BIP68, scripts) belong to the coins path in `block`.
+//! Transaction rules: Core's `CheckTransaction` as [`check_tx`], the finality predicate
+//! `IsFinalTx` as [`is_final`], and the constants the block rules share with them (§2.1,
+//! §2.2, §2.3, §3.1); then the rules that read the coins a transaction spends, each a
+//! function of one transaction and exactly the facts about its inputs, handed over as a
+//! [`Coin`] per input: `CheckTxInputs` as [`check_tx_inputs`], BIP68 as
+//! [`sequence_locks_satisfied`], and `GetTransactionSigOpCost` as [`sigop_cost`]. The
+//! block's coins path calls the second group once per transaction in block order; the
+//! scripts are the `script` module's.
 
 use core::fmt;
 
-use bitcoin::{OutPoint, Transaction};
+use bitcoin::consensus::encode::serialize;
+use bitcoin::{OutPoint, Script, Transaction, TxOut};
 
+use crate::header::Context;
 use crate::params::{BlockTime, Height};
-use crate::script::{SigOpMode, sigop_count};
+use crate::script::{
+    MAX_SCRIPT_SIZE, ScriptFlags, SigOpMode, p2sh_sigop_count, sigop_count, witness_sigop_count,
+};
 
 /// Core's `WITNESS_SCALE_FACTOR`: a base byte weighs this many witness bytes (BIP141).
 pub const WITNESS_SCALE_FACTOR: u64 = 4;
@@ -41,6 +46,257 @@ pub const COINBASE_SCRIPT_SIG_SIZE_MAX: usize = 100;
 
 /// Core's `CTxIn::SEQUENCE_FINAL`: an input with this `nSequence` opts out of `nLockTime`.
 pub const SEQUENCE_FINAL: u32 = 0xffff_ffff;
+
+/// Core's `COINBASE_MATURITY`: a coinbase output may be spent once this many blocks deep,
+/// the spending block counted (§2.3).
+pub const COINBASE_MATURITY: u32 = 100;
+
+/// Core's `SEQUENCE_LOCKTIME_DISABLE_FLAG`: bit 31 of `nSequence` set means no relative
+/// lock (BIP68).
+pub const SEQUENCE_LOCKTIME_DISABLE_FLAG: u32 = 1 << 31;
+/// Core's `SEQUENCE_LOCKTIME_TYPE_FLAG`: bit 22 set means the lock is in time, clear means
+/// blocks (BIP68).
+pub const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
+/// Core's `SEQUENCE_LOCKTIME_MASK`: the low sixteen bits carry the lock's value (BIP68).
+pub const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000_ffff;
+/// Core's `SEQUENCE_LOCKTIME_GRANULARITY`: a time lock counts in units of 512 seconds,
+/// `value << 9` (BIP68).
+pub const SEQUENCE_LOCKTIME_GRANULARITY: u32 = 9;
+
+/// An unspent transaction output, with the facts the rules read about it: where it sits,
+/// what it pays, which block created it and whether that was a coinbase. Core's `Coin`
+/// plus its `COutPoint` key, because a coin here is a value the node hands the crate and
+/// the crate hands back in a delta, and it must say what it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Coin {
+    /// The transaction and output index that created it.
+    pub outpoint: OutPoint,
+    /// The output: value and `scriptPubKey`.
+    pub output: TxOut,
+    /// The height of the block that created it.
+    pub height: Height,
+    /// Whether that block's coinbase created it, for maturity (§2.3).
+    pub coinbase: bool,
+}
+
+impl Coin {
+    /// The bytes the UTXO set hashes for this coin, Core's `TxOutSer`:
+    /// `outpoint || u32 LE ((height << 1) | coinbase) || CTxOut` (§7). One encoder, so the
+    /// live `muhash` and a `hash_serialized_3` cannot disagree about a coin.
+    #[must_use]
+    pub fn hash_record(&self) -> Vec<u8> {
+        // A coin in the set is spendable: unspendable outputs are never added (§7).
+        assert!(!is_unspendable(&self.output.script_pubkey));
+        let code = (self.height.get() << 1) | u32::from(self.coinbase);
+        assert_eq!(code >> 1, self.height.get());
+        let outpoint = serialize(&self.outpoint);
+        let output = serialize(&self.output);
+        assert_eq!(outpoint.len(), 36);
+        let mut record = Vec::with_capacity(outpoint.len() + 4 + output.len());
+        record.extend_from_slice(&outpoint);
+        record.extend_from_slice(&code.to_le_bytes());
+        record.extend_from_slice(&output);
+        assert_eq!(record.len(), 40 + output.len());
+        record
+    }
+}
+
+/// Core's `CScript::IsUnspendable`: a `scriptPubKey` that opens with `OP_RETURN` or is
+/// longer than [`MAX_SCRIPT_SIZE`] can never be satisfied, so its output never enters the
+/// UTXO set (§7).
+#[must_use]
+pub fn is_unspendable(script_pubkey: &Script) -> bool {
+    const OP_RETURN: u8 = 0x6a;
+    let bytes = script_pubkey.as_bytes();
+    bytes.first() == Some(&OP_RETURN) || bytes.len() > MAX_SCRIPT_SIZE
+}
+
+/// Why `CheckTxInputs` refused a transaction, in the vocabulary of Core's reject reasons;
+/// `Display` gives the reason string. The missing-or-spent case is the block's, because
+/// only the block knows what was spent earlier in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TxInputsError {
+    /// `bad-txns-premature-spend-of-coinbase`: a coinbase output spent before
+    /// [`COINBASE_MATURITY`].
+    PrematureCoinbaseSpend {
+        /// The input's index.
+        input: usize,
+        /// How deep the coinbase was, the spending block counted.
+        depth: u32,
+    },
+    /// `bad-txns-inputvalues-outofrange`: an input value, or the running sum, above
+    /// [`MAX_MONEY`].
+    InputValuesOutOfRange {
+        /// The input whose value took it out of range.
+        input: usize,
+    },
+    /// `bad-txns-in-belowout`: the inputs pay less than the outputs.
+    InBelowOut {
+        /// The sum of the input values.
+        value_in: u64,
+        /// The sum of the output values.
+        value_out: u64,
+    },
+}
+
+impl fmt::Display for TxInputsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::PrematureCoinbaseSpend { .. } => "bad-txns-premature-spend-of-coinbase",
+            Self::InputValuesOutOfRange { .. } => "bad-txns-inputvalues-outofrange",
+            Self::InBelowOut { .. } => "bad-txns-in-belowout",
+        })
+    }
+}
+
+impl std::error::Error for TxInputsError {}
+
+/// Core's `CheckTxInputs` after `HaveInputs`, in its order: per input, coinbase maturity
+/// then the value and running sum in range; then inputs at least the outputs (§2.3, §3.1).
+/// Returns the fee. `coins` is one per input, in input order, the block having resolved
+/// which exist; `spend_height` is the block's.
+pub fn check_tx_inputs(
+    tx: &Transaction,
+    coins: &[Coin],
+    spend_height: Height,
+) -> Result<u64, TxInputsError> {
+    assert!(!tx.is_coinbase());
+    assert_eq!(coins.len(), tx.input.len(), "one coin per input");
+    let mut value_in: u64 = 0;
+    for (input, (txin, coin)) in tx.input.iter().zip(coins).enumerate() {
+        assert_eq!(coin.outpoint, txin.previous_output);
+        // A coin from a later block cannot be spent; one from this block has depth 0.
+        assert!(coin.height <= spend_height);
+        if coin.coinbase {
+            let depth = spend_height.get() - coin.height.get();
+            if depth < COINBASE_MATURITY {
+                return Err(TxInputsError::PrematureCoinbaseSpend { input, depth });
+            }
+        }
+        // Core adds first and then checks both terms; a value above MAX_MONEY, including
+        // the top bit its signed CAmount would read as negative, fails either way.
+        let value = coin.output.value.to_sat();
+        if value > MAX_MONEY {
+            return Err(TxInputsError::InputValuesOutOfRange { input });
+        }
+        // Both terms are at most MAX_MONEY, so the sum cannot overflow.
+        value_in += value;
+        if value_in > MAX_MONEY {
+            return Err(TxInputsError::InputValuesOutOfRange { input });
+        }
+    }
+    let value_out = value_out(tx);
+    if value_in < value_out {
+        return Err(TxInputsError::InBelowOut {
+            value_in,
+            value_out,
+        });
+    }
+    let fee = value_in - value_out;
+    // Core's `bad-txns-fee-outofrange` is unreachable, and says so: both sums are in range
+    // and the difference is non-negative.
+    assert!(fee <= MAX_MONEY);
+    Ok(fee)
+}
+
+/// Core's `CTransaction::GetValueOut`: the sum of the output values, which [`check_tx`] has
+/// already bounded.
+#[must_use]
+pub fn value_out(tx: &Transaction) -> u64 {
+    let mut total: u64 = 0;
+    for output in &tx.output {
+        total += output.value.to_sat();
+        assert!(total <= MAX_MONEY, "check_tx passed: outputs in MoneyRange");
+    }
+    total
+}
+
+/// What an input's relative lock is measured from (BIP68): the height of the block that
+/// created the coin, and, for a time lock, the median time past of the block before that
+/// one, which the node reads from its header tree. `None` when the input carries no time
+/// lock; the coins path asserts it is present when one does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelativeLockBase {
+    /// The coin's height: `Coin::height`, or the block's own for a coin created in it.
+    pub height: Height,
+    /// The median time past of the block at `height - 1`.
+    pub median_time_past: Option<BlockTime>,
+}
+
+/// Core's `SequenceLocks`: `CalculateSequenceLocks` folded into `EvaluateSequenceLocks`.
+/// Are every input's relative locks satisfied by the block `context` describes (BIP68)?
+/// Always, before CSV or for a transaction below version 2, the version compared unsigned
+/// as Core's `uint32_t` is. `bases` is one per input, in input order.
+#[must_use]
+pub fn sequence_locks_satisfied(
+    tx: &Transaction,
+    bases: &[RelativeLockBase],
+    context: &Context,
+) -> bool {
+    assert_eq!(bases.len(), tx.input.len(), "one base per input");
+    if !bip68_applies(tx) || !context.rules().csv_active() {
+        return true;
+    }
+    // Core's `-1`: the lock is the last invalid height or time, so -1 means none.
+    let mut height_min: i64 = -1;
+    let mut time_min: i64 = -1;
+    for (input, base) in tx.input.iter().zip(bases) {
+        let sequence = input.sequence.to_consensus_u32();
+        if sequence & SEQUENCE_LOCKTIME_DISABLE_FLAG != 0 {
+            continue;
+        }
+        let value = i64::from(sequence & SEQUENCE_LOCKTIME_MASK);
+        assert!(value <= 0xffff);
+        if sequence & SEQUENCE_LOCKTIME_TYPE_FLAG != 0 {
+            let coin_time = base
+                .median_time_past
+                .expect("populate flagged the input as time-locked");
+            let lock = i64::from(coin_time.get()) + (value << SEQUENCE_LOCKTIME_GRANULARITY) - 1;
+            time_min = time_min.max(lock);
+        } else {
+            let lock = i64::from(base.height.get()) + value - 1;
+            height_min = height_min.max(lock);
+        }
+    }
+    let height = i64::from(context.height().get());
+    let median_time_past = i64::from(context.median_time_past().get());
+    height_min < height && time_min < median_time_past
+}
+
+/// BIP68 reads `nSequence` only on transactions of version 2 or more, the version compared
+/// as the `uint32_t` Core stores, so a negative `i32` is a very large version.
+#[must_use]
+pub fn bip68_applies(tx: &Transaction) -> bool {
+    tx.version.0.cast_unsigned() >= 2
+}
+
+/// Core's `GetTransactionSigOpCost`: the legacy count scaled, plus, for a spend, the P2SH
+/// redeem script's count scaled when `P2SH` is in `flags`, plus the witness program's
+/// unscaled count when `WITNESS` is (§2.2). `prevouts` is one per input, in input order,
+/// and empty for a coinbase, whose inputs have none.
+#[must_use]
+pub fn sigop_cost(tx: &Transaction, prevouts: &[TxOut], flags: ScriptFlags) -> u64 {
+    let mut cost = legacy_sigop_count(tx) * WITNESS_SCALE_FACTOR;
+    if tx.is_coinbase() {
+        assert!(prevouts.is_empty());
+        return cost;
+    }
+    assert_eq!(prevouts.len(), tx.input.len(), "one prevout per input");
+    for (input, prevout) in tx.input.iter().zip(prevouts) {
+        let script_sig = input.script_sig.as_bytes();
+        let script_pubkey = prevout.script_pubkey.as_bytes();
+        if flags.contains(ScriptFlags::P2SH) {
+            cost += u64::from(p2sh_sigop_count(script_pubkey, script_sig)) * WITNESS_SCALE_FACTOR;
+        }
+        cost += u64::from(witness_sigop_count(
+            script_sig,
+            script_pubkey,
+            &input.witness,
+            flags,
+        ));
+    }
+    cost
+}
 
 /// Why `CheckTransaction` refused a transaction, in the vocabulary of Core's reject reasons;
 /// `Display` gives the reason string. The fields are the evidence.
@@ -250,13 +506,19 @@ mod tests {
     use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 
     use super::{
-        COINBASE_SCRIPT_SIG_SIZE_MAX, LOCKTIME_THRESHOLD, MAX_BLOCK_WEIGHT, MAX_MONEY,
-        SEQUENCE_FINAL, TxError, WITNESS_SCALE_FACTOR, check_tx, is_final, legacy_sigop_count,
+        COINBASE_MATURITY, COINBASE_SCRIPT_SIG_SIZE_MAX, Coin, LOCKTIME_THRESHOLD,
+        MAX_BLOCK_WEIGHT, MAX_MONEY, RelativeLockBase, SEQUENCE_FINAL,
+        SEQUENCE_LOCKTIME_DISABLE_FLAG, SEQUENCE_LOCKTIME_GRANULARITY, SEQUENCE_LOCKTIME_MASK,
+        SEQUENCE_LOCKTIME_TYPE_FLAG, TxError, TxInputsError, WITNESS_SCALE_FACTOR, bip68_applies,
+        check_tx, check_tx_inputs, is_final, is_unspendable, legacy_sigop_count,
+        sequence_locks_satisfied, sigop_cost, value_out,
     };
-    use crate::params::{BlockTime, Height};
+    use crate::header::Context;
+    use crate::params::{BlockTime, ChainParams, Height, RegtestOverrides};
     use crate::script::vectors::{
         CORE_SIGHASH_JSON, CORE_TX_INVALID_JSON, CORE_TX_VALID_JSON, Json,
     };
+    use crate::script::{MAX_SCRIPT_SIZE, ScriptFlags, push_encoding};
 
     fn tx_from_hex(hex: &str) -> Transaction {
         deserialize(&Vec::<u8>::from_hex(hex).unwrap()).unwrap()
@@ -536,6 +798,452 @@ mod tests {
             ),
             (TxError::CoinbaseLength { size: 0 }, "bad-cb-length"),
             (TxError::PrevoutNull { index: 0 }, "bad-txns-prevout-null"),
+        ];
+        for (error, reason) in cases {
+            assert_eq!(error.to_string(), reason);
+        }
+    }
+
+    fn coin(value: u64, height: u32, coinbase: bool) -> Coin {
+        Coin {
+            outpoint: input(1, 0).previous_output,
+            output: output(value),
+            height: Height::new(height),
+            coinbase,
+        }
+    }
+
+    /// The constants agree with the pinned crate's spellings of BIP68.
+    #[test]
+    fn bip68_constants_match_rust_bitcoin() {
+        assert_eq!(
+            SEQUENCE_LOCKTIME_DISABLE_FLAG,
+            Sequence::ENABLE_LOCKTIME_NO_RBF.to_consensus_u32() & (1 << 31)
+        );
+        assert_eq!(SEQUENCE_LOCKTIME_TYPE_FLAG, 1 << 22);
+        assert_eq!(SEQUENCE_LOCKTIME_MASK, 0xffff);
+        assert_eq!(1u64 << SEQUENCE_LOCKTIME_GRANULARITY, 512);
+        assert_eq!(COINBASE_MATURITY, 100);
+    }
+
+    /// `TxOutSer` byte for byte: the outpoint as serialized, the height and coinbase flag
+    /// packed little-endian, then the output as serialized, which is what
+    /// `feature_utxo_set_hash.py` feeds its `MuHash`.
+    #[test]
+    fn coin_hash_record_is_cores_txoutser() {
+        let coin = Coin {
+            outpoint: OutPoint {
+                txid: Txid::from_byte_array([0x11; 32]),
+                vout: 1,
+            },
+            output: TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+            height: Height::new(5),
+            coinbase: true,
+        };
+        let mut expected = vec![0x11; 32];
+        expected.extend_from_slice(&[1, 0, 0, 0]);
+        expected.extend_from_slice(&[11, 0, 0, 0]);
+        expected.extend_from_slice(&[0xe8, 0x03, 0, 0, 0, 0, 0, 0]);
+        expected.extend_from_slice(&[0x01, 0x51]);
+        assert_eq!(coin.hash_record(), expected);
+
+        // Coinbase clear flips the low bit only; the height fills the rest.
+        let plain = Coin {
+            coinbase: false,
+            height: Height::new(0x7fff_ffff),
+            ..coin.clone()
+        };
+        assert_eq!(&plain.hash_record()[36..40], &[0xfe, 0xff, 0xff, 0xff]);
+        assert_eq!(
+            plain.hash_record().len(),
+            36 + 4 + bitcoin::consensus::encode::serialize(&plain.output).len()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is_unspendable")]
+    fn hash_record_of_an_unspendable_output_is_a_bug() {
+        let mut coin = coin(1, 1, false);
+        coin.output.script_pubkey = ScriptBuf::from_bytes(vec![0x6a]);
+        let _unreachable = coin.hash_record();
+    }
+
+    #[test]
+    fn is_unspendable_is_op_return_or_oversize() {
+        let script = |bytes: Vec<u8>| is_unspendable(&ScriptBuf::from_bytes(bytes));
+        assert!(script(vec![0x6a]));
+        assert!(script(vec![0x6a, 0x01, 0x00]));
+        assert!(!script(vec![]));
+        assert!(!script(vec![0x51]));
+        assert!(!script(vec![0x00, 0x6a]));
+        assert!(!script(vec![0x51; MAX_SCRIPT_SIZE]));
+        assert!(script(vec![0x51; MAX_SCRIPT_SIZE + 1]));
+    }
+
+    /// Maturity counts the spending block: 100 deep spends, 99 does not; a coin of the
+    /// spending block itself is 0 deep.
+    #[test]
+    fn check_tx_inputs_enforces_coinbase_maturity() {
+        let tx = simple_tx();
+        let coinbase = coin(1_000, 1, true);
+        assert_eq!(
+            check_tx_inputs(&tx, std::slice::from_ref(&coinbase), Height::new(100)),
+            Err(TxInputsError::PrematureCoinbaseSpend {
+                input: 0,
+                depth: 99
+            })
+        );
+        assert_eq!(
+            check_tx_inputs(&tx, std::slice::from_ref(&coinbase), Height::new(101)),
+            Ok(0)
+        );
+        assert_eq!(
+            check_tx_inputs(&tx, &[coinbase], Height::new(1)),
+            Err(TxInputsError::PrematureCoinbaseSpend { input: 0, depth: 0 })
+        );
+        assert_eq!(
+            check_tx_inputs(&tx, &[coin(1_000, 1, false)], Height::new(1)),
+            Ok(0)
+        );
+    }
+
+    /// Core checks each value and the running sum, and reports the input that took it out
+    /// of range; then the inputs must cover the outputs, and the difference is the fee.
+    #[test]
+    fn check_tx_inputs_bounds_values_and_returns_the_fee() {
+        let mut tx = simple_tx();
+        tx.input.push(input(2, 0));
+        let second = |value: u64| Coin {
+            outpoint: input(2, 0).previous_output,
+            ..coin(value, 1, false)
+        };
+        assert_eq!(
+            check_tx_inputs(
+                &tx,
+                &[coin(MAX_MONEY + 1, 1, false), second(0)],
+                Height::new(1)
+            ),
+            Err(TxInputsError::InputValuesOutOfRange { input: 0 })
+        );
+        assert_eq!(
+            check_tx_inputs(&tx, &[coin(MAX_MONEY, 1, false), second(1)], Height::new(1)),
+            Err(TxInputsError::InputValuesOutOfRange { input: 1 })
+        );
+        assert_eq!(
+            check_tx_inputs(&tx, &[coin(u64::MAX, 1, false), second(0)], Height::new(1)),
+            Err(TxInputsError::InputValuesOutOfRange { input: 0 })
+        );
+        assert_eq!(
+            check_tx_inputs(&tx, &[coin(999, 1, false), second(0)], Height::new(1)),
+            Err(TxInputsError::InBelowOut {
+                value_in: 999,
+                value_out: 1_000
+            })
+        );
+        assert_eq!(
+            check_tx_inputs(&tx, &[coin(999, 1, false), second(501)], Height::new(1)),
+            Ok(500)
+        );
+        assert_eq!(
+            check_tx_inputs(&tx, &[coin(MAX_MONEY, 1, false), second(0)], Height::new(1)),
+            Ok(MAX_MONEY - 1_000)
+        );
+        assert_eq!(value_out(&tx), 1_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "one coin per input")]
+    fn check_tx_inputs_with_the_wrong_coin_count_is_a_bug() {
+        let _unreachable = check_tx_inputs(&simple_tx(), &[], Height::new(1));
+    }
+
+    fn context_at(height: u32, median_time_past: u32, csv: Option<Height>) -> Context {
+        let params = ChainParams::regtest(RegtestOverrides {
+            csv,
+            ..RegtestOverrides::default()
+        });
+        let hash = bitcoin::BlockHash::from_byte_array([0x11; 32]);
+        Context::new(
+            Height::new(height),
+            BlockTime::new(median_time_past),
+            BlockTime::new(median_time_past + 1),
+            params.genesis().header.bits,
+            params.rules_at(Height::new(height), hash, None),
+        )
+    }
+
+    /// Core's `miner_tests`: a height lock of `n` on a coin at `h` is satisfied from block
+    /// `h + n` on; a time lock of `n` measures `n * 512` seconds from the median time past
+    /// before the coin's block against the median time past before this one, with the
+    /// same last-invalid semantics as `nLockTime`.
+    #[test]
+    fn sequence_locks_follow_bip68() {
+        let context = context_at(200, 1_000_000, None);
+        let locked = |sequence: u32, height: u32, median_time_past: Option<u32>| {
+            let mut tx = simple_tx();
+            tx.input[0].sequence = Sequence::from_consensus(sequence);
+            let base = RelativeLockBase {
+                height: Height::new(height),
+                median_time_past: median_time_past.map(BlockTime::new),
+            };
+            sequence_locks_satisfied(&tx, &[base], &context)
+        };
+        // Relative height: coin at 190, lock 10, satisfied at 200 and not with the coin
+        // one block later.
+        assert!(locked(10, 190, None));
+        assert!(!locked(10, 191, None));
+        assert!(locked(0, 200, None));
+        assert!(!locked(1, 200, None));
+        assert!(!locked(0xffff, 1, None));
+
+        // Relative time: 1024 seconds from a base 1024 before the median, satisfied only
+        // when the base is at least that far back.
+        let time = SEQUENCE_LOCKTIME_TYPE_FLAG | 2;
+        assert!(locked(time, 100, Some(1_000_000 - 1_024)));
+        assert!(!locked(time, 100, Some(1_000_000 - 1_023)));
+        assert!(locked(
+            SEQUENCE_LOCKTIME_TYPE_FLAG,
+            100,
+            Some(1_000_000 - 1)
+        ));
+        assert!(!locked(
+            SEQUENCE_LOCKTIME_TYPE_FLAG | 1,
+            100,
+            Some(1_000_000 - 1)
+        ));
+
+        // The disable flag, and bits above the mask, carry no lock.
+        assert!(locked(SEQUENCE_LOCKTIME_DISABLE_FLAG | 0xffff, 200, None));
+        assert!(locked(SEQUENCE_LOCKTIME_DISABLE_FLAG | time, 200, None));
+        assert!(locked(1 << 16, 200, None));
+    }
+
+    /// Two inputs: the strictest lock of each kind wins, and the kinds are independent.
+    #[test]
+    fn sequence_locks_take_the_strictest_input() {
+        let context = context_at(200, 1_000_000, None);
+        let mut tx = simple_tx();
+        tx.input.push(input(2, 0));
+        tx.input[0].sequence = Sequence::from_consensus(5);
+        tx.input[1].sequence = Sequence::from_consensus(SEQUENCE_LOCKTIME_TYPE_FLAG | 1);
+        let base = |height: u32, median_time_past: u32| RelativeLockBase {
+            height: Height::new(height),
+            median_time_past: Some(BlockTime::new(median_time_past)),
+        };
+        assert!(sequence_locks_satisfied(
+            &tx,
+            &[base(195, 0), base(0, 1_000_000 - 512)],
+            &context
+        ));
+        assert!(!sequence_locks_satisfied(
+            &tx,
+            &[base(196, 0), base(0, 1_000_000 - 512)],
+            &context
+        ));
+        assert!(!sequence_locks_satisfied(
+            &tx,
+            &[base(195, 0), base(0, 1_000_000 - 511)],
+            &context
+        ));
+    }
+
+    /// Below version 2, or before CSV, no sequence is a lock; the version compares as
+    /// `uint32_t`, so a negative one is above 2.
+    #[test]
+    fn sequence_locks_need_version_two_and_csv() {
+        let mut tx = simple_tx();
+        tx.input[0].sequence = Sequence::from_consensus(1);
+        let base = RelativeLockBase {
+            height: Height::new(200),
+            median_time_past: None,
+        };
+        let active = context_at(200, 1_000_000, None);
+        assert!(!sequence_locks_satisfied(&tx, &[base], &active));
+        tx.version = Version::ONE;
+        assert!(!bip68_applies(&tx));
+        assert!(sequence_locks_satisfied(&tx, &[base], &active));
+        tx.version = Version(-1);
+        assert!(bip68_applies(&tx));
+        assert!(!sequence_locks_satisfied(&tx, &[base], &active));
+        tx.version = Version::TWO;
+        let inactive = context_at(200, 1_000_000, Some(Height::new(1_000)));
+        assert!(!inactive.rules().csv_active());
+        assert!(sequence_locks_satisfied(&tx, &[base], &inactive));
+    }
+
+    #[test]
+    #[should_panic(expected = "time-locked")]
+    fn sequence_locks_without_the_time_base_is_a_bug() {
+        let mut tx = simple_tx();
+        tx.input[0].sequence = Sequence::from_consensus(SEQUENCE_LOCKTIME_TYPE_FLAG | 1);
+        let base = RelativeLockBase {
+            height: Height::new(100),
+            median_time_past: None,
+        };
+        let _unreachable =
+            sequence_locks_satisfied(&tx, &[base], &context_at(200, 1_000_000, None));
+    }
+
+    /// A spend of output 0 of `creation`, with the given `scriptSig` and witness.
+    fn spend_of(creation: &Transaction, script_sig: Vec<u8>, witness: &[Vec<u8>]) -> Transaction {
+        Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: creation.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::from_bytes(script_sig),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(witness),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        }
+    }
+
+    /// A coinbase-shaped transaction paying to `script_pubkey`, as Core's `BuildTxs`.
+    fn creation_of(script_pubkey: Vec<u8>) -> Transaction {
+        Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(script_pubkey),
+            }],
+        }
+    }
+
+    fn p2sh(redeem_script: &[u8]) -> Vec<u8> {
+        use bitcoin::hashes::hash160;
+        let mut script = vec![0xa9, 0x14];
+        script.extend_from_slice(&hash160::Hash::hash(redeem_script).to_byte_array());
+        script.push(0x87);
+        script
+    }
+
+    fn p2wsh(witness_script: &[u8]) -> Vec<u8> {
+        use bitcoin::hashes::sha256;
+        let mut script = vec![0x00, 0x20];
+        script.extend_from_slice(&sha256::Hash::hash(witness_script).to_byte_array());
+        script
+    }
+
+    /// Core's `GetTxSigOpCost`, case by case: legacy counting is inaccurate and reads only
+    /// the transaction's own scripts; P2SH reveals the redeem script under the flag;
+    /// witness programs cost unscaled, only under `WITNESS`, only for version 0, and never
+    /// on a coinbase.
+    #[test]
+    fn sigop_cost_is_cores_get_transaction_sig_op_cost() {
+        let flags = ScriptFlags::WITNESS.union(ScriptFlags::P2SH);
+        let pubkey = vec![0x02; 33];
+        let mut multisig = vec![0x51];
+        multisig.extend(push_encoding(&pubkey));
+        multisig.extend(push_encoding(&pubkey));
+        multisig.extend([0x52, 0xaf]);
+        let prevout = |script_pubkey: &[u8]| TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(script_pubkey.to_vec()),
+        };
+
+        // Multisig, legacy counting.
+        let creation = creation_of(multisig.clone());
+        let spend = spend_of(&creation, vec![0x00, 0x00], &[]);
+        assert_eq!(sigop_cost(&spend, &[prevout(&multisig)], flags), 0);
+        assert_eq!(sigop_cost(&creation, &[], flags), 20 * WITNESS_SCALE_FACTOR);
+
+        // Multisig nested in P2SH.
+        let mut script_sig = vec![0x00, 0x00];
+        script_sig.extend(push_encoding(&multisig));
+        let script_pubkey = p2sh(&multisig);
+        let spend = spend_of(&creation_of(script_pubkey.clone()), script_sig, &[]);
+        assert_eq!(
+            sigop_cost(&spend, &[prevout(&script_pubkey)], flags),
+            2 * WITNESS_SCALE_FACTOR
+        );
+        assert_eq!(
+            sigop_cost(&spend, &[prevout(&script_pubkey)], ScriptFlags::NONE),
+            0
+        );
+
+        // P2WPKH.
+        let mut p2wpkh = vec![0x00, 0x14];
+        p2wpkh.extend([0x33; 20]);
+        let witness = [vec![], vec![]];
+        let spend = spend_of(&creation_of(p2wpkh.clone()), vec![], &witness);
+        assert_eq!(sigop_cost(&spend, &[prevout(&p2wpkh)], flags), 1);
+        assert_eq!(
+            sigop_cost(&spend, &[prevout(&p2wpkh)], ScriptFlags::P2SH),
+            0
+        );
+        let mut version_one = p2wpkh.clone();
+        version_one[0] = 0x51;
+        assert_eq!(sigop_cost(&spend, &[prevout(&version_one)], flags), 0);
+        let mut coinbase = spend.clone();
+        coinbase.input[0].previous_output = OutPoint::null();
+        assert!(coinbase.is_coinbase());
+        assert_eq!(sigop_cost(&coinbase, &[], flags), 0);
+
+        // P2WPKH nested in P2SH.
+        let script_pubkey = p2sh(&p2wpkh);
+        let spend = spend_of(
+            &creation_of(script_pubkey.clone()),
+            push_encoding(&p2wpkh),
+            &witness,
+        );
+        assert_eq!(sigop_cost(&spend, &[prevout(&script_pubkey)], flags), 1);
+
+        // P2WSH.
+        let witness = [vec![], vec![], multisig.clone()];
+        let script_pubkey = p2wsh(&multisig);
+        let spend = spend_of(&creation_of(script_pubkey.clone()), vec![], &witness);
+        assert_eq!(sigop_cost(&spend, &[prevout(&script_pubkey)], flags), 2);
+        assert_eq!(
+            sigop_cost(&spend, &[prevout(&script_pubkey)], ScriptFlags::P2SH),
+            0
+        );
+
+        // P2WSH nested in P2SH.
+        let redeem_script = p2wsh(&multisig);
+        let script_pubkey = p2sh(&redeem_script);
+        let spend = spend_of(
+            &creation_of(script_pubkey.clone()),
+            push_encoding(&redeem_script),
+            &witness,
+        );
+        assert_eq!(sigop_cost(&spend, &[prevout(&script_pubkey)], flags), 2);
+    }
+
+    #[test]
+    fn input_errors_display_cores_reject_reasons() {
+        let cases = [
+            (
+                TxInputsError::PrematureCoinbaseSpend { input: 0, depth: 1 },
+                "bad-txns-premature-spend-of-coinbase",
+            ),
+            (
+                TxInputsError::InputValuesOutOfRange { input: 0 },
+                "bad-txns-inputvalues-outofrange",
+            ),
+            (
+                TxInputsError::InBelowOut {
+                    value_in: 0,
+                    value_out: 1,
+                },
+                "bad-txns-in-belowout",
+            ),
         ];
         for (error, reason) in cases {
             assert_eq!(error.to_string(), reason);

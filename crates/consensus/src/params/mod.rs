@@ -31,7 +31,7 @@ mod rules;
 
 pub use height::{BlockTime, Height};
 pub use regtest::{RegtestArgError, RegtestOverrides};
-pub use rules::{BIP34_IMPLIES_BIP30_LIMIT, Rules};
+pub use rules::{BIP34_IMPLIES_BIP30_LIMIT, Bip30, Rules, block_subsidy};
 // The flag type belongs to the interpreter; `Rules` produces it, so it is re-exported
 // here for callers that only know about chain parameters.
 pub use crate::script::ScriptFlags;

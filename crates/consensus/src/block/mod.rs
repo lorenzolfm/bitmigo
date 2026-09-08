@@ -7,12 +7,14 @@
 //! that need the block's height and its predecessor's median time past, all of which arrive
 //! in the [`Context`] the header stages already use, so the node can run both at receipt
 //! (BM-D1 decision 9) and write the raw bytes knowing they passed every header-only check.
-//! The coins path (`populate`, `confirm`, `connect`) lands beside them.
+//! The coins path, [`populate`], [`confirm`] and [`connect`] over the same `Context`, runs
+//! in chain order and produces the [`BlockDelta`]; it lives in `coins`.
 //!
 //! The signet solution check belongs in `check_block` (§2.8); the `signet` module adds it
 //! behind a `BlockChallenge` on [`ChainParams`], which is why `check_block` already takes the
 //! parameters.
 
+mod coins;
 mod merkle;
 
 use core::fmt;
@@ -29,6 +31,10 @@ use crate::tx::{
     legacy_sigop_count,
 };
 
+pub use coins::{
+    BlockDelta, ConfirmError, Confirmed, ConnectError, InputCoin, InputSource, MAX_BLOCK_INPUTS,
+    MAX_BLOCK_OUTPUTS, Prefetch, confirm, connect, populate,
+};
 pub use merkle::{MerkleRoot, merkle_root};
 
 /// Core's `MINIMUM_WITNESS_COMMITMENT`: a coinbase output is the witness commitment when its
@@ -371,5 +377,7 @@ pub fn witness_root(block: &Block) -> [u8; 32] {
     merkle_root(leaves).root
 }
 
+#[cfg(test)]
+mod coins_tests;
 #[cfg(test)]
 mod tests;

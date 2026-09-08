@@ -24,18 +24,15 @@
     reason = "test-only code: an index out of bounds fails the test with a panic, as intended"
 )]
 
-use std::collections::HashMap;
-
-use bitcoin::consensus::deserialize;
 use bitcoin::hex::FromHex;
-use bitcoin::{OutPoint, Script, ScriptBuf, Transaction, TxOut, Txid, Witness};
+use bitcoin::{Script, Witness};
 
 use super::opcode::OP_1;
 use super::taproot::TAPROOT_LEAF_TAPSCRIPT;
 use super::vectors::{
     CORE_SCRIPT_TESTS_JSON, CORE_TX_INVALID_JSON, CORE_TX_VALID_JSON, Expected, Json, ParsedFlags,
-    crediting_transaction, parse_flags, parse_script, parse_script_error, spending_transaction,
-    taproot_single_leaf,
+    TxRow, crediting_transaction, parse_flags, parse_script, parse_script_error, parse_tx_row,
+    spending_transaction, taproot_single_leaf,
 };
 use super::{ScriptError, ScriptFlags, TxPrecomputed, TxSigChecker, verify_script};
 
@@ -291,60 +288,6 @@ fn script_tests_json() {
             skipped_policy: 129,
         }
     );
-}
-
-/// A transaction row: the spent outputs keyed by outpoint, the transaction, its flag list.
-struct TxRow {
-    prevouts: Vec<TxOut>,
-    tx: Transaction,
-    flags: ParsedFlags,
-    text: String,
-}
-
-/// Reads one `[[inputs...], hex, flags]` row, or `None` for a comment row.
-fn parse_tx_row(row: &Json) -> Option<TxRow> {
-    let row = row.as_array();
-    if !row[0].is_array() {
-        return None;
-    }
-    assert_eq!(row.len(), 3, "bad test: {row:?}");
-    let mut spent: HashMap<OutPoint, TxOut> = HashMap::new();
-    for input in row[0].as_array() {
-        let input = input.as_array();
-        assert!(input.len() == 3 || input.len() == 4, "bad test: {row:?}");
-        let txid: Txid = input[0].as_str().parse().expect("a txid in display order");
-        // Core casts the index through `uint32_t`, which is how `-1` becomes `0xffffffff`.
-        let vout = u32::try_from(input[1].as_i64().rem_euclid(1 << 32)).expect("32 bits");
-        let amount = input.get(3).map_or(0, |amount| {
-            u64::try_from(amount.as_i64()).expect("a non-negative amount")
-        });
-        let previous = spent.insert(
-            OutPoint { txid, vout },
-            TxOut {
-                value: bitcoin::Amount::from_sat(amount),
-                script_pubkey: ScriptBuf::from_bytes(parse_script(input[2].as_str())),
-            },
-        );
-        assert!(previous.is_none(), "duplicate prevout: {row:?}");
-    }
-    let tx: Transaction =
-        deserialize(&Vec::<u8>::from_hex(row[1].as_str()).expect("hex")).expect("a transaction");
-    let prevouts = tx
-        .input
-        .iter()
-        .map(|input| {
-            spent
-                .get(&input.previous_output)
-                .unwrap_or_else(|| panic!("bad test, prevout missing: {row:?}"))
-                .clone()
-        })
-        .collect();
-    Some(TxRow {
-        prevouts,
-        tx,
-        flags: parse_flags(row[2].as_str()),
-        text: format!("{row:?}"),
-    })
 }
 
 /// Core's `CheckTxScripts`: every input through `VerifyScript`, stopping at the first failure.
