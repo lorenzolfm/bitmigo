@@ -1,0 +1,32 @@
+# Clippy reads the nearest clippy.toml only, so the workspace settings are repeated here.
+too-many-lines-threshold = 70
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+
+# This crate is pure: no filesystem, no network, no clock, no process. Anything that reaches
+# the outside world belongs in the `bitmigo` binary. The lists below are a tripwire for the
+# common paths, not a proof of purity; the review is.
+disallowed-types = [
+    { path = "std::fs::File", reason = "consensus does no I/O; the node binary owns the disk" },
+    { path = "std::fs::OpenOptions", reason = "consensus does no I/O; the node binary owns the disk" },
+    { path = "std::net::TcpStream", reason = "consensus does no networking; the node binary owns peers" },
+    { path = "std::net::TcpListener", reason = "consensus does no networking; the node binary owns peers" },
+    { path = "std::net::UdpSocket", reason = "consensus does no networking; the node binary owns peers" },
+    { path = "std::io::Stdin", reason = "consensus has no terminal" },
+    { path = "std::io::Stdout", reason = "consensus has no terminal" },
+    { path = "std::io::Stderr", reason = "consensus has no terminal" },
+    { path = "std::time::SystemTime", reason = "consensus has no clock; time is an input (block header, median time past)" },
+    { path = "std::time::Instant", reason = "consensus has no clock; measure from the caller" },
+]
+disallowed-methods = [
+    { path = "std::fs::read", reason = "consensus does no I/O" },
+    { path = "std::fs::read_to_string", reason = "consensus does no I/O" },
+    { path = "std::fs::write", reason = "consensus does no I/O" },
+    { path = "std::io::stdin", reason = "consensus has no terminal" },
+    { path = "std::io::stdout", reason = "consensus has no terminal" },
+    { path = "std::io::stderr", reason = "consensus has no terminal" },
+    { path = "std::env::var", reason = "consensus reads no environment; configuration is an argument" },
+    { path = "std::thread::spawn", reason = "consensus is single-threaded; the caller parallelises" },
+    { path = "std::process::exit", reason = "consensus returns verdicts; it never exits the process" },
+]

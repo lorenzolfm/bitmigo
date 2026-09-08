@@ -1,0 +1,7 @@
+# Hard rule H1: a function fits on a screen. Enforced by `clippy::too_many_lines` (deny).
+too-many-lines-threshold = 70
+
+# A test that unwraps fails with a panic, which is what a failing test does anyway.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

@@ -1,0 +1,5 @@
+# 100 columns and 4 spaces are rustfmt's defaults. Stated so that the intent survives a
+# change of defaults: two copies of the code fit side by side.
+max_width = 100
+tab_spaces = 4
+hard_tabs = false

@@ -1,0 +1,14 @@
+[package]
+name = "bitmigo"
+description = "A full archival Bitcoin node with its own consensus implementation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bitmigo-consensus.workspace = true
+
+[lints]
+workspace = true
