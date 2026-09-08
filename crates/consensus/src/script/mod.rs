@@ -10,7 +10,8 @@
 //! the checker; [`verify_script`] (`VerifyScript`) runs the scripts of one input in Core's
 //! order, P2SH, witness v0 and taproot included, with the BIP341 commitment in `taproot`;
 //! and [`verify_input`] is the seam the node calls, one input of one transaction at a time
-//! over a shared [`TxPrecomputed`] (BM-D2 decision 4).
+//! over a shared [`TxPrecomputed`] (BM-D2 decision 4). [`sigop_count`] is the one static
+//! scan, Core's `GetSigOpCount`, for the block-level signature operation budget.
 //!
 //! Nothing here reads the chain: a checker holds one transaction, the outputs it spends and
 //! the precompute built from them, and every answer is a pure function of those. That is what
@@ -26,6 +27,7 @@ mod opcode;
 mod reader;
 mod script_flags;
 mod sighash;
+mod sigops;
 mod stack;
 mod taproot;
 #[cfg(test)]
@@ -39,7 +41,13 @@ pub use checker::TxSigChecker;
 pub use error::ScriptError;
 pub use script_flags::ScriptFlags;
 pub use sighash::{TaprootSpend, TxPrecomputed};
+pub use sigops::{SigOpMode, sigop_count};
 pub use verify::{verify_input, verify_script};
+
+// The block rules build the BIP34 height prefix the way `CScript() << height` does; these
+// two are the pieces of that operator, shared rather than reimplemented.
+pub(crate) use num::ScriptNum;
+pub(crate) use reader::push_encoding;
 
 /// The rules a script executes under: Core's `SigVersion` minus `TAPROOT`, because the
 /// taproot key path executes no script. A key-path signature is checked through
