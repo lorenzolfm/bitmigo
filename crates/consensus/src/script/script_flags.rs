@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! [`ScriptFlags`]: which script rules a block is verified under.
+//! [`ScriptFlags`]: which script rules a script is verified under.
 //!
-//! This type is a stand-in. The script interpreter, when it lands, owns the flag type and
-//! this module will produce values of that type instead; until then the seven flags block
-//! validation can apply live here. The bit positions are Core's (`script/interpreter.h`),
-//! so a value here and a `SCRIPT_VERIFY_*` mask there can be compared side by side.
+//! Exactly the seven flags block validation can apply, Core's `MANDATORY_SCRIPT_VERIFY_FLAGS`,
+//! and nothing else: a policy flag such as `STRICTENC` or `CLEANSTACK` has no value here, so
+//! a block cannot be rejected for a rule the network does not enforce. The bit positions are
+//! Core's (`script/interpreter.h`), so a value here and a `SCRIPT_VERIFY_*` mask there can be
+//! compared side by side, and the test vectors' flag names map onto it bit for bit. The
+//! interpreter owns the type; `params` re-exports it so that `Rules::script_flags` produces
+//! the value the interpreter consumes.
 
 use core::fmt;
 
@@ -45,6 +48,18 @@ impl ScriptFlags {
     #[must_use]
     pub const fn union(self, other: ScriptFlags) -> ScriptFlags {
         ScriptFlags(self.0 | other.0)
+    }
+
+    /// The flags in both sets.
+    #[must_use]
+    pub const fn intersection(self, other: ScriptFlags) -> ScriptFlags {
+        ScriptFlags(self.0 & other.0)
+    }
+
+    /// The flags of `self` that are not in `other`.
+    #[must_use]
+    pub const fn difference(self, other: ScriptFlags) -> ScriptFlags {
+        ScriptFlags(self.0 & !other.0)
     }
 
     /// Whether every flag of `other` is set in `self`.
@@ -127,6 +142,25 @@ mod tests {
         assert!(!ScriptFlags::MANDATORY.is_subset_of(p2sh_witness));
         assert!(ScriptFlags::NONE.is_subset_of(ScriptFlags::NONE));
         assert!(ScriptFlags::NONE.contains(ScriptFlags::NONE));
+    }
+
+    #[test]
+    fn set_algebra() {
+        let p2sh_witness = ScriptFlags::P2SH.union(ScriptFlags::WITNESS);
+        let witness_taproot = ScriptFlags::WITNESS.union(ScriptFlags::TAPROOT);
+        assert_eq!(
+            p2sh_witness.intersection(witness_taproot),
+            ScriptFlags::WITNESS
+        );
+        assert_eq!(p2sh_witness.difference(witness_taproot), ScriptFlags::P2SH);
+        assert_eq!(
+            ScriptFlags::MANDATORY.difference(ScriptFlags::MANDATORY),
+            ScriptFlags::NONE
+        );
+        assert_eq!(
+            ScriptFlags::NONE.intersection(ScriptFlags::MANDATORY),
+            ScriptFlags::NONE
+        );
     }
 
     #[test]

@@ -7,10 +7,13 @@ binary. Re-fetch them from the revision below before diffing; do not hand-edit.
 | File | Upstream | Revision | Licence | SHA-256 |
 | --- | --- | --- | --- | --- |
 | `sighash.json` | `bitcoin/bitcoin`, `src/test/data/sighash.json` | tag `v31.1` | MIT | `52cf23c2076e7f129c71d5508631d3e5ae3be1b1cb0585c0e23bbb4bb373e924` |
+| `script_tests.json` | `bitcoin/bitcoin`, `src/test/data/script_tests.json` | tag `v31.1` | MIT | `bc23cb1dfa760d50042f534da23cbbe4b6fbb03d7def0b64f8de049453d6ead5` |
+| `tx_valid.json` | `bitcoin/bitcoin`, `src/test/data/tx_valid.json` | tag `v31.1` | MIT | `f8a9e275c581aa24650695bd2b1c718d30f948452934accee83cb32331a9a7a0` |
+| `tx_invalid.json` | `bitcoin/bitcoin`, `src/test/data/tx_invalid.json` | tag `v31.1` | MIT | `0c02ce44ff3a880458f9569a25589315a07f924fcaadac828613d4615776ca52` |
 | `bip340-test-vectors.csv` | `bitcoin/bips`, `bip-0340/test-vectors.csv` | `09e21036a4001fe6c9ba65c1d3a39b737768132f` (2026-09-03) | BSD-2-Clause OR MIT OR CC0-1.0 (BIP340 `License-Code`) | `34c9d1d9c3a88d524bc80778540dc43f8306ec249a7485293063c376db851c2d` |
 | `bip341-wallet-test-vectors.json` | `bitcoin/bips`, `bip-0341/wallet-test-vectors.json` | `09e21036a4001fe6c9ba65c1d3a39b737768132f` (2026-09-03) | BSD-3-Clause (BIP341 `License`) | `403e19fb81dd1f31e745699216308f61fb403774b2aafa87b631b8f7c042d37f` |
 
-## Bitcoin Core (`sighash.json`)
+## Bitcoin Core (`sighash.json`, `script_tests.json`, `tx_valid.json`, `tx_invalid.json`)
 
 `src/test/data/README.md` in Bitcoin Core states that the data files in that directory are
 distributed under the MIT software license, see the accompanying file `COPYING`

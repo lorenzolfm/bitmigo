@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Test-only helpers for the `script` tests: the vendored vector files, a JSON reader small
-//! enough to audit, a CSV splitter and a deterministic transaction generator.
+//! enough to audit, a CSV splitter, a deterministic transaction generator, and the pieces of
+//! Core's test harness the script vectors need: `ParseScript`'s mini-language,
+//! `ParseScriptFlags`, `ParseScriptError`, `AmountFromValue` and the crediting/spending
+//! transaction pair `DoTest` builds.
 //!
-//! `serde` is not a dependency (decision 0001) and will not become one for three files of
-//! arrays, strings and integers. The JSON reader below handles exactly the subset those files
+//! `serde` is not a dependency (decision 0001) and will not become one for six files of
+//! arrays, strings and numbers. The JSON reader below handles exactly the subset those files
 //! use, iteratively with an explicit stack, and panics on anything else: a vector file that
 //! stops parsing is a test failure, not an input to recover from.
 
@@ -19,8 +22,19 @@ use bitcoin::hex::FromHex;
 use bitcoin::transaction::Version;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 
+use super::num::ScriptNum;
+use super::opcode::{OP_0, OP_1, OP_1NEGATE, PARSER_NAMES};
+use super::reader::push_encoding;
+use super::{ScriptError, ScriptFlags};
+
 /// Core's `src/test/data/sighash.json` at v31.1; see `tests/data/README.md`.
 pub const CORE_SIGHASH_JSON: &str = include_str!("../../tests/data/sighash.json");
+/// Core's `src/test/data/script_tests.json` at v31.1; see `tests/data/README.md`.
+pub const CORE_SCRIPT_TESTS_JSON: &str = include_str!("../../tests/data/script_tests.json");
+/// Core's `src/test/data/tx_valid.json` at v31.1; see `tests/data/README.md`.
+pub const CORE_TX_VALID_JSON: &str = include_str!("../../tests/data/tx_valid.json");
+/// Core's `src/test/data/tx_invalid.json` at v31.1; see `tests/data/README.md`.
+pub const CORE_TX_INVALID_JSON: &str = include_str!("../../tests/data/tx_invalid.json");
 /// BIP340's `test-vectors.csv`; see `tests/data/README.md`.
 pub const BIP340_TEST_VECTORS_CSV: &str = include_str!("../../tests/data/bip340-test-vectors.csv");
 /// BIP341's `wallet-test-vectors.json`; see `tests/data/README.md`.
@@ -30,12 +44,14 @@ pub const BIP341_WALLET_TEST_VECTORS_JSON: &str =
 /// The vector files nest six deep; anything past this is a broken file.
 const JSON_DEPTH_MAX: usize = 16;
 
-/// A JSON value, as far as the vector files need one.
+/// A JSON value, as far as the vector files need one. A number with a fraction or an
+/// exponent is kept as text: the only ones are amounts in BTC, read by [`Json::as_satoshis`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Json {
     Null,
     Bool(bool),
     Number(i64),
+    Decimal(String),
     Str(String),
     Array(Vec<Json>),
     Object(Vec<(String, Json)>),
@@ -105,6 +121,28 @@ impl Json {
             panic!("not a number")
         };
         *number
+    }
+
+    pub fn is_array(&self) -> bool {
+        matches!(self, Json::Array(_))
+    }
+
+    /// Core's `AmountFromValue`: a number in BTC with at most eight decimals, in satoshis.
+    /// The vectors write `0.00000001` and integers; exponents are not needed.
+    pub fn as_satoshis(&self) -> u64 {
+        const SATOSHIS_PER_BTC: u64 = 100_000_000;
+        match self {
+            Json::Number(btc) => u64::try_from(*btc).expect("non-negative") * SATOSHIS_PER_BTC,
+            Json::Decimal(text) => {
+                let (whole, fraction) = text.split_once('.').expect("a decimal point");
+                assert!(fraction.len() <= 8, "more than eight decimals: {text}");
+                assert!(fraction.bytes().all(|b| b.is_ascii_digit()), "{text}");
+                let whole: u64 = whole.parse().expect("digits");
+                let fraction: u64 = format!("{fraction:0<8}").parse().expect("digits");
+                whole * SATOSHIS_PER_BTC + fraction
+            }
+            _ => panic!("not an amount"),
+        }
     }
 
     /// A hex string decoded.
@@ -217,13 +255,223 @@ fn read_number(bytes: &[u8], position: usize) -> (Option<Json>, usize) {
     if bytes.get(end) == Some(&b'-') {
         end += 1;
     }
+    let mut decimal = false;
     // Bounded by the input length.
-    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
-        end += 1;
+    while let Some(&byte) = bytes.get(end) {
+        if byte.is_ascii_digit() {
+            end += 1;
+        } else if matches!(byte, b'.' | b'e' | b'E' | b'+' | b'-') {
+            decimal = true;
+            end += 1;
+        } else {
+            break;
+        }
     }
     let text = core::str::from_utf8(&bytes[position..end]).expect("ASCII digits");
+    if decimal {
+        return (Some(Json::Decimal(text.to_owned())), end);
+    }
     let number = text.parse::<i64>().expect("an integer");
     (Some(Json::Number(number)), end)
+}
+
+/// Core's `ParseScript`: whitespace-separated tokens, each a decimal number pushed as a
+/// script number, `0x`-prefixed hex inserted verbatim (how the vectors spell explicit push
+/// opcodes and malformed data), a single-quoted string pushed as data, or an opcode name
+/// with or without its `OP_` prefix.
+pub fn parse_script(text: &str) -> Vec<u8> {
+    let mut script = Vec::new();
+    for word in text.split([' ', '\t', '\n']) {
+        if word.is_empty() {
+            continue;
+        }
+        let digits = word.strip_prefix('-').unwrap_or(word);
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            let number: i64 = word.parse().expect("fits i64");
+            assert!(number.abs() <= 0xffff_ffff, "out of range: {word}");
+            script.extend(push_int64(number));
+        } else if let Some(hex) = word.strip_prefix("0x")
+            && !hex.is_empty()
+            && let Ok(raw) = Vec::<u8>::from_hex(hex)
+        {
+            script.extend(raw);
+        } else if word.len() >= 2 && word.starts_with('\'') && word.ends_with('\'') {
+            script.extend(push_encoding(&word.as_bytes()[1..word.len() - 1]));
+        } else {
+            let name = word.strip_prefix("OP_").unwrap_or(word);
+            let (byte, _) = PARSER_NAMES
+                .iter()
+                .find(|(_, candidate)| candidate.strip_prefix("OP_") == Some(name))
+                .unwrap_or_else(|| panic!("unknown opcode {word}"));
+            script.push(*byte);
+        }
+    }
+    script
+}
+
+/// Core's `CScript::push_int64`: the small-integer opcodes where they apply, otherwise a
+/// push of the minimal script number.
+pub fn push_int64(number: i64) -> Vec<u8> {
+    match number {
+        -1 => vec![OP_1NEGATE],
+        0 => vec![OP_0],
+        1..=16 => vec![OP_1 + u8::try_from(number - 1).expect("0..16")],
+        _ => push_encoding(&ScriptNum::from_i64(number).encode()),
+    }
+}
+
+/// The 21 `SCRIPT_VERIFY_*` names of `ScriptFlagNamesToEnum`, with the consensus flag each
+/// maps to, or `None` for a policy flag the interpreter has no switch for.
+const FLAG_NAMES: [(&str, Option<ScriptFlags>); 21] = [
+    ("P2SH", Some(ScriptFlags::P2SH)),
+    ("STRICTENC", None),
+    ("DERSIG", Some(ScriptFlags::DERSIG)),
+    ("LOW_S", None),
+    ("NULLDUMMY", Some(ScriptFlags::NULLDUMMY)),
+    ("SIGPUSHONLY", None),
+    ("MINIMALDATA", None),
+    ("DISCOURAGE_UPGRADABLE_NOPS", None),
+    ("CLEANSTACK", None),
+    ("MINIMALIF", None),
+    ("NULLFAIL", None),
+    (
+        "CHECKLOCKTIMEVERIFY",
+        Some(ScriptFlags::CHECKLOCKTIMEVERIFY),
+    ),
+    (
+        "CHECKSEQUENCEVERIFY",
+        Some(ScriptFlags::CHECKSEQUENCEVERIFY),
+    ),
+    ("WITNESS", Some(ScriptFlags::WITNESS)),
+    ("DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM", None),
+    ("WITNESS_PUBKEYTYPE", None),
+    ("CONST_SCRIPTCODE", None),
+    ("TAPROOT", Some(ScriptFlags::TAPROOT)),
+    ("DISCOURAGE_UPGRADABLE_TAPROOT_VERSION", None),
+    ("DISCOURAGE_OP_SUCCESS", None),
+    ("DISCOURAGE_UPGRADABLE_PUBKEYTYPE", None),
+];
+
+/// A vector's flag list, split into the consensus flags and the policy names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedFlags {
+    pub consensus: ScriptFlags,
+    pub policy: Vec<&'static str>,
+}
+
+impl ParsedFlags {
+    pub fn has_policy(&self, name: &str) -> bool {
+        self.policy.contains(&name)
+    }
+}
+
+/// Core's `ParseScriptFlags`: comma-separated names, empty or `NONE` for no flags.
+pub fn parse_flags(text: &str) -> ParsedFlags {
+    let mut parsed = ParsedFlags {
+        consensus: ScriptFlags::NONE,
+        policy: Vec::new(),
+    };
+    if text.is_empty() || text == "NONE" {
+        return parsed;
+    }
+    for word in text.split(',') {
+        let (name, flag) = FLAG_NAMES
+            .iter()
+            .find(|(name, _)| *name == word)
+            .unwrap_or_else(|| panic!("unknown flag {word}"));
+        match flag {
+            Some(flag) => parsed.consensus = parsed.consensus.union(*flag),
+            None => parsed.policy.push(name),
+        }
+    }
+    parsed
+}
+
+/// The `scriptError` names of `script_tests.cpp` that name no consensus error: the checks
+/// behind them are policy flags.
+const POLICY_ERROR_NAMES: [&str; 11] = [
+    "SIG_HASHTYPE",
+    "MINIMALDATA",
+    "SIG_HIGH_S",
+    "PUBKEYTYPE",
+    "MINIMALIF",
+    "NULLFAIL",
+    "DISCOURAGE_UPGRADABLE_NOPS",
+    "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM",
+    "WITNESS_PUBKEYTYPE",
+    "OP_CODESEPARATOR",
+    "SIG_FINDANDDELETE",
+];
+
+/// What a `script_tests.json` row expects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expected {
+    Ok,
+    Consensus(ScriptError),
+    Policy(&'static str),
+}
+
+/// Core's `ParseScriptError` over its 44 names, sorted into the three kinds above.
+pub fn parse_script_error(name: &str) -> Expected {
+    if name == "OK" {
+        return Expected::Ok;
+    }
+    if let Some(policy) = POLICY_ERROR_NAMES
+        .iter()
+        .find(|candidate| **candidate == name)
+    {
+        return Expected::Policy(policy);
+    }
+    let error = ScriptError::ALL
+        .iter()
+        .find(|error| error.name() == name)
+        .unwrap_or_else(|| panic!("unknown script error {name}"));
+    Expected::Consensus(*error)
+}
+
+/// `BuildCreditingTransaction`: version 1, one null-prevout input with scriptSig `OP_0 OP_0`,
+/// one output paying `amount` to `script_pubkey`.
+pub fn crediting_transaction(script_pubkey: &[u8], amount: u64) -> Transaction {
+    Transaction {
+        version: Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::from_bytes(vec![OP_0, OP_0]),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(amount),
+            script_pubkey: ScriptBuf::from_bytes(script_pubkey.to_vec()),
+        }],
+    }
+}
+
+/// `BuildSpendingTransaction`: version 1, one input spending the crediting transaction's
+/// output with `script_sig` and `witness`, one output of the same amount to an empty script.
+pub fn spending_transaction(
+    script_sig: &[u8],
+    witness: Witness,
+    credit: &Transaction,
+) -> Transaction {
+    Transaction {
+        version: Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: credit.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::from_bytes(script_sig.to_vec()),
+            sequence: Sequence::MAX,
+            witness,
+        }],
+        output: vec![TxOut {
+            value: credit.output[0].value,
+            script_pubkey: ScriptBuf::new(),
+        }],
+    }
 }
 
 /// The rows of a header-first CSV with no quoting, split on commas.
@@ -346,7 +594,130 @@ pub fn random_script_code(prng: &mut Prng) -> ScriptBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::Json;
+    use super::super::ScriptFlags;
+    use super::{Expected, Json, parse_flags, parse_script, parse_script_error};
+    use crate::script::ScriptError;
+
+    #[test]
+    fn parse_script_follows_core_s_grammar() {
+        assert_eq!(parse_script(""), Vec::<u8>::new());
+        assert_eq!(parse_script("  1  2  "), vec![0x51, 0x52]);
+        assert_eq!(
+            parse_script("0 -1 16 17 -17 255 256"),
+            vec![
+                0x00, 0x4f, 0x60, 0x01, 0x11, 0x01, 0x91, 0x02, 0xff, 0x00, 0x02, 0x00, 0x01
+            ]
+        );
+        assert_eq!(parse_script("0x4c 0x01 0xff"), vec![0x4c, 0x01, 0xff]);
+        assert_eq!(parse_script("'Az' EQUAL"), vec![0x02, 0x41, 0x7a, 0x87]);
+        assert_eq!(parse_script("'' DUP OP_DUP"), vec![0x00, 0x76, 0x76]);
+        assert_eq!(parse_script("RESERVED VERIF NOP10"), vec![0x50, 0x65, 0xb9]);
+        assert_eq!(parse_script("CHECKLOCKTIMEVERIFY"), vec![0xb1]);
+        assert_eq!(
+            parse_script("4294967295"),
+            vec![0x05, 0xff, 0xff, 0xff, 0xff, 0x00]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown opcode")]
+    fn parse_script_rejects_names_core_rejects() {
+        let _ = parse_script("CHECKSIGADD");
+    }
+
+    #[test]
+    fn parse_flags_splits_consensus_from_policy() {
+        assert_eq!(parse_flags("").consensus, ScriptFlags::NONE);
+        assert_eq!(parse_flags("NONE").consensus, ScriptFlags::NONE);
+        let parsed = parse_flags("P2SH,STRICTENC,WITNESS,CLEANSTACK");
+        assert_eq!(
+            parsed.consensus,
+            ScriptFlags::P2SH.union(ScriptFlags::WITNESS)
+        );
+        assert_eq!(parsed.policy, vec!["STRICTENC", "CLEANSTACK"]);
+        assert!(parsed.has_policy("CLEANSTACK"));
+        assert!(!parsed.has_policy("MINIMALIF"));
+    }
+
+    #[test]
+    fn parse_script_error_knows_all_44_names() {
+        assert_eq!(parse_script_error("OK"), Expected::Ok);
+        assert_eq!(
+            parse_script_error("EVAL_FALSE"),
+            Expected::Consensus(ScriptError::EvalFalse)
+        );
+        assert_eq!(parse_script_error("NULLFAIL"), Expected::Policy("NULLFAIL"));
+        assert_eq!(
+            parse_script_error("TAPSCRIPT_EMPTY_PUBKEY"),
+            Expected::Consensus(ScriptError::TapscriptEmptyPubkey)
+        );
+        let names = [
+            "OK",
+            "EVAL_FALSE",
+            "OP_RETURN",
+            "SCRIPT_SIZE",
+            "PUSH_SIZE",
+            "OP_COUNT",
+            "STACK_SIZE",
+            "SIG_COUNT",
+            "PUBKEY_COUNT",
+            "VERIFY",
+            "EQUALVERIFY",
+            "CHECKMULTISIGVERIFY",
+            "CHECKSIGVERIFY",
+            "NUMEQUALVERIFY",
+            "BAD_OPCODE",
+            "DISABLED_OPCODE",
+            "INVALID_STACK_OPERATION",
+            "INVALID_ALTSTACK_OPERATION",
+            "UNBALANCED_CONDITIONAL",
+            "NEGATIVE_LOCKTIME",
+            "UNSATISFIED_LOCKTIME",
+            "SIG_HASHTYPE",
+            "SIG_DER",
+            "MINIMALDATA",
+            "SIG_PUSHONLY",
+            "SIG_HIGH_S",
+            "SIG_NULLDUMMY",
+            "PUBKEYTYPE",
+            "CLEANSTACK",
+            "MINIMALIF",
+            "NULLFAIL",
+            "DISCOURAGE_UPGRADABLE_NOPS",
+            "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM",
+            "WITNESS_PROGRAM_WRONG_LENGTH",
+            "WITNESS_PROGRAM_WITNESS_EMPTY",
+            "WITNESS_PROGRAM_MISMATCH",
+            "WITNESS_MALLEATED",
+            "WITNESS_MALLEATED_P2SH",
+            "WITNESS_UNEXPECTED",
+            "WITNESS_PUBKEYTYPE",
+            "TAPSCRIPT_EMPTY_PUBKEY",
+            "OP_CODESEPARATOR",
+            "SIG_FINDANDDELETE",
+            "SCRIPTNUM",
+        ];
+        assert_eq!(names.len(), 44);
+        let mut consensus = 0;
+        for name in names {
+            match parse_script_error(name) {
+                Expected::Ok | Expected::Policy(_) => {}
+                Expected::Consensus(_) => consensus += 1,
+            }
+        }
+        assert_eq!(consensus, 32);
+    }
+
+    #[test]
+    fn amounts_read_as_satoshis() {
+        assert_eq!(Json::Number(1).as_satoshis(), 100_000_000);
+        assert_eq!(Json::Number(0).as_satoshis(), 0);
+        assert_eq!(Json::Decimal("0.00000001".into()).as_satoshis(), 1);
+        assert_eq!(Json::Decimal("1.5".into()).as_satoshis(), 150_000_000);
+        let json = Json::parse("[0.00000001, 0]");
+        assert_eq!(json.as_array()[0].as_satoshis(), 1);
+        assert_eq!(json.as_array()[1].as_satoshis(), 0);
+    }
 
     #[test]
     fn json_reader_handles_the_vector_shapes() {

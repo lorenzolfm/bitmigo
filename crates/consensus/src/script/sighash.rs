@@ -21,7 +21,8 @@ use bitcoin::sighash::TapSighash;
 use bitcoin::{Amount, Script, Transaction, TxOut, Txid};
 
 use super::ScriptError;
-use super::reader::{OP_CODESEPARATOR, OpRead, read_op};
+use super::opcode::OP_CODESEPARATOR;
+use super::reader::{OpRead, read_op};
 
 /// Taproot only: a 64-byte signature carries no hash type byte and means [`SIGHASH_ALL`].
 pub const SIGHASH_DEFAULT: u8 = 0x00;
@@ -233,8 +234,8 @@ fn legacy_encode_input(
 }
 
 /// `CTransactionSignatureSerializer::SerializeScriptCode`: the `scriptCode` with every
-/// `OP_CODESEPARATOR` removed, which the interpreter's witness v0 path does *not* do (BIP143
-/// keeps them; §4.7's row saying "BASE and v0" is wrong and BM-16 corrects it).
+/// `OP_CODESEPARATOR` removed, which the witness v0 digest does *not* do (BIP143 keeps
+/// them; `docs/consensus-rules.md` §4.7).
 ///
 /// Two quirks are Core's and therefore consensus. The length prefix is computed from the
 /// script's size minus the separator count before anything is written. And the bytes are

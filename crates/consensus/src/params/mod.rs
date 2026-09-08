@@ -28,12 +28,13 @@
 mod height;
 mod regtest;
 mod rules;
-mod script_flags;
 
 pub use height::{BlockTime, Height};
 pub use regtest::{RegtestArgError, RegtestOverrides};
 pub use rules::{BIP34_IMPLIES_BIP30_LIMIT, Rules};
-pub use script_flags::ScriptFlags;
+// The flag type belongs to the interpreter; `Rules` produces it, so it is re-exported
+// here for callers that only know about chain parameters.
+pub use crate::script::ScriptFlags;
 
 use bitcoin::block::Block;
 use bitcoin::constants::genesis_block;

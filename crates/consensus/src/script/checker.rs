@@ -208,9 +208,10 @@ impl<'a> TxSigChecker<'a> {
         let input = self.tx.input.get(self.index).expect("asserted in `new`");
         let tx_sequence = i64::from(input.sequence.to_consensus_u32());
 
-        // Relative locks exist from version 2 (BIP68); the field is signed, so negative
-        // versions fail here too.
-        if self.tx.version.0 < 2 {
+        // Relative locks exist from version 2 (BIP68). Core compares the version as
+        // `uint32_t`, so a negative version is a very large one and passes: `tx_valid.json`
+        // has a version -1 transaction that spends through CHECKSEQUENCEVERIFY.
+        if self.tx.version.0.cast_unsigned() < 2 {
             return false;
         }
         // The disable bit on the transaction's own field switches the check off, so an input
@@ -709,14 +710,16 @@ mod tests {
         let mut base = random_transaction(&mut prng);
         let type_flag: u32 = 1 << 22;
         let type_flag_operand: i64 = 1 << 22;
-        let cases: [(i32, u32, i64, bool); 12] = [
+        let cases: [(i32, u32, i64, bool); 14] = [
             // (tx version, input nSequence, operand, expected)
             (2, 10, 10, true),
             (2, 10, 9, true),
             (2, 10, 11, false),
-            // Version 1 and negative versions have no relative locks.
+            // Version 1 has no relative locks; a negative version is a large unsigned one.
             (1, 10, 10, false),
-            (-1, 10, 10, false),
+            (0, 10, 10, false),
+            (-1, 10, 10, true),
+            (i32::MIN, 10, 10, true),
             // The disable flag on the input turns the check off.
             (2, 0x0a | (1 << 31), 0x0a, false),
             // Time-based against time-based, in 512-second units.
