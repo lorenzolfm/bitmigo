@@ -12,10 +12,12 @@
 //! produce on its own (`SCRIPTNUM` under `MINIMALDATA`, `SIG_DER` without `DERSIG`,
 //! `CLEANSTACK` under the flag, `SIG_PUSHONLY` under `SIGPUSHONLY`): stripped, the row's
 //! outcome is unknowable, so it is skipped and counted. Rows expecting a policy-only error
-//! are skipped and counted. Rows carrying `TAPROOT` wait for the taproot verifier.
+//! are skipped and counted. The five tapscript rows are built as Core's harness builds
+//! them: `#SCRIPT#` items through the script parser, `#CONTROLBLOCK#` and
+//! `#TAPROOTOUTPUT#` from a one-leaf tree under `key0`.
 //!
-//! Every test ends by asserting the counts of rows run, skipped and deferred, so that a
-//! change to the reduction or to the vendored file shows up as a number, not silently.
+//! Every test ends by asserting the counts of rows run and skipped, so that a change to the
+//! reduction or to the vendored file shows up as a number, not silently.
 
 #![allow(
     clippy::indexing_slicing,
@@ -28,46 +30,48 @@ use bitcoin::consensus::deserialize;
 use bitcoin::hex::FromHex;
 use bitcoin::{OutPoint, Script, ScriptBuf, Transaction, TxOut, Txid, Witness};
 
+use super::opcode::OP_1;
+use super::taproot::TAPROOT_LEAF_TAPSCRIPT;
 use super::vectors::{
     CORE_SCRIPT_TESTS_JSON, CORE_TX_INVALID_JSON, CORE_TX_VALID_JSON, Expected, Json, ParsedFlags,
     crediting_transaction, parse_flags, parse_script, parse_script_error, spending_transaction,
+    taproot_single_leaf,
 };
 use super::{ScriptError, ScriptFlags, TxPrecomputed, TxSigChecker, verify_script};
 
-/// The consensus flags the interpreter implements today: everything but `TAPROOT`, which
-/// waits for the taproot verifier. The transaction vectors run under this set.
-const IMPLEMENTED: ScriptFlags = ScriptFlags::P2SH
-    .union(ScriptFlags::DERSIG)
-    .union(ScriptFlags::NULLDUMMY)
-    .union(ScriptFlags::CHECKLOCKTIMEVERIFY)
-    .union(ScriptFlags::CHECKSEQUENCEVERIFY)
-    .union(ScriptFlags::WITNESS);
-
-/// The six implemented flags one by one, for walking their subsets.
-const IMPLEMENTED_FLAGS: [ScriptFlags; 6] = [
+/// The seven consensus flags one by one, for walking their subsets.
+const MANDATORY_FLAGS: [ScriptFlags; 7] = [
     ScriptFlags::P2SH,
     ScriptFlags::DERSIG,
     ScriptFlags::NULLDUMMY,
     ScriptFlags::CHECKLOCKTIMEVERIFY,
     ScriptFlags::CHECKSEQUENCEVERIFY,
     ScriptFlags::WITNESS,
+    ScriptFlags::TAPROOT,
 ];
 
-/// Core's `TrimFlags`: `WITNESS` needs `P2SH` (and `CLEANSTACK` needs both, but it is policy).
+/// Core's `TrimFlags`: `WITNESS` needs `P2SH` (and `CLEANSTACK` needs both, but it is
+/// policy). Core lets `TAPROOT` stand without `WITNESS`, where it can never be reached;
+/// this interpreter asserts the implication instead, so the trim drops it too, which
+/// changes no verdict.
 fn trim_flags(flags: ScriptFlags) -> ScriptFlags {
-    if flags.contains(ScriptFlags::P2SH) {
-        flags
-    } else {
-        flags.difference(ScriptFlags::WITNESS)
+    let mut trimmed = flags;
+    if !trimmed.contains(ScriptFlags::P2SH) {
+        trimmed = trimmed.difference(ScriptFlags::WITNESS);
     }
+    if !trimmed.contains(ScriptFlags::WITNESS) {
+        trimmed = trimmed.difference(ScriptFlags::TAPROOT);
+    }
+    trimmed
 }
 
-/// Every valid combination of the implemented flags.
-fn implemented_combinations() -> Vec<ScriptFlags> {
+/// Every valid combination of the consensus flags: sixteen of the four free ones times the
+/// four the two implications allow.
+fn mandatory_combinations() -> Vec<ScriptFlags> {
     let mut combinations = Vec::new();
-    for mask in 0u32..(1 << IMPLEMENTED_FLAGS.len()) {
+    for mask in 0u32..(1 << MANDATORY_FLAGS.len()) {
         let mut flags = ScriptFlags::NONE;
-        for (bit, flag) in IMPLEMENTED_FLAGS.iter().enumerate() {
+        for (bit, flag) in MANDATORY_FLAGS.iter().enumerate() {
             if mask & (1 << bit) != 0 {
                 flags = flags.union(*flag);
             }
@@ -76,7 +80,7 @@ fn implemented_combinations() -> Vec<ScriptFlags> {
             combinations.push(flags);
         }
     }
-    assert_eq!(combinations.len(), 48);
+    assert_eq!(combinations.len(), 64);
     combinations
 }
 
@@ -102,19 +106,82 @@ fn verify(
     )
 }
 
-/// The witness array of a row: hex items, then the amount in BTC.
-fn parse_witness(json: &Json) -> (Witness, u64) {
+/// The scriptPubKey text Core's harness replaces by the generated taproot output.
+const TAPROOT_OUTPUT_MARKER: &str = "0x51 0x20 #TAPROOTOUTPUT#";
+
+/// A row's witness array, read: the items, the amount in satoshis, and the output key of
+/// the one-leaf tree a `#CONTROLBLOCK#` item was built for, if there was one.
+struct WitnessRow {
+    witness: Witness,
+    amount: u64,
+    taproot_output: Option<[u8; 32]>,
+}
+
+/// The witness array of a row: hex items, or `#SCRIPT#` and `#CONTROLBLOCK#` items built
+/// as `script_json_test` builds them, then the amount in BTC.
+fn parse_witness(json: &Json) -> WitnessRow {
     let elements = json.as_array();
     let (amount, items) = elements.split_last().expect("at least the amount");
-    let items: Vec<Vec<u8>> = items
-        .iter()
-        .map(|item| {
-            let text = item.as_str();
-            assert!(!text.starts_with('#'), "taproot rows are deferred: {text}");
-            Vec::<u8>::from_hex(text).expect("hex witness item")
-        })
-        .collect();
-    (Witness::from_slice(&items), amount.as_satoshis())
+    let mut stack: Vec<Vec<u8>> = Vec::new();
+    let mut taproot_output = None;
+    for item in items {
+        let text = item.as_str();
+        if let Some(script) = text.strip_prefix("#SCRIPT#") {
+            stack.push(parse_script(script));
+        } else if text == "#CONTROLBLOCK#" {
+            // The leaf is the item before the control block.
+            let leaf = stack
+                .last()
+                .expect("the leaf script precedes its control block");
+            let (control, output_key) = taproot_single_leaf(leaf, TAPROOT_LEAF_TAPSCRIPT);
+            stack.push(control);
+            taproot_output = Some(output_key);
+        } else {
+            stack.push(Vec::<u8>::from_hex(text).expect("hex witness item"));
+        }
+    }
+    WitnessRow {
+        witness: Witness::from_slice(&stack),
+        amount: amount.as_satoshis(),
+        taproot_output,
+    }
+}
+
+/// The scripts and witness of one `script_tests.json` row, ready to run.
+struct RowInputs {
+    script_sig: Vec<u8>,
+    script_pubkey: Vec<u8>,
+    witness: Witness,
+    amount: u64,
+}
+
+/// Reads a row's scriptSig, scriptPubKey and optional witness array, with the taproot
+/// markers built as Core's harness builds them. `pos` is 1 when the row has a witness.
+fn parse_row_inputs(row: &[Json], pos: usize) -> RowInputs {
+    assert!(pos <= 1);
+    let witness_row = if pos == 1 {
+        parse_witness(&row[0])
+    } else {
+        WitnessRow {
+            witness: Witness::new(),
+            amount: 0,
+            taproot_output: None,
+        }
+    };
+    let script_pubkey = if row[pos + 1].as_str() == TAPROOT_OUTPUT_MARKER {
+        let output_key = witness_row.taproot_output.expect("a #CONTROLBLOCK# item");
+        let mut script = vec![OP_1, 0x20];
+        script.extend(output_key);
+        script
+    } else {
+        parse_script(row[pos + 1].as_str())
+    };
+    RowInputs {
+        script_sig: parse_script(row[pos].as_str()),
+        script_pubkey,
+        witness: witness_row.witness,
+        amount: witness_row.amount,
+    }
 }
 
 /// What the interpreter must return for a row once its policy flags are gone, or `None`
@@ -153,13 +220,12 @@ struct ScriptCounts {
     run_ok: usize,
     run_err: usize,
     skipped_policy: usize,
-    deferred_taproot: usize,
 }
 
 #[test]
 fn script_tests_json() {
     let rows = Json::parse(CORE_SCRIPT_TESTS_JSON);
-    let combinations = implemented_combinations();
+    let combinations = mandatory_combinations();
     let mut counts = ScriptCounts::default();
     for row in rows.as_array() {
         let row = row.as_array();
@@ -170,22 +236,17 @@ fn script_tests_json() {
         let pos = usize::from(row[0].is_array());
         assert!(row.len() >= 4 + pos, "bad test: {row:?}");
         let flags = parse_flags(row[pos + 2].as_str());
-        if flags.consensus.contains(ScriptFlags::TAPROOT) {
-            counts.deferred_taproot += 1;
-            continue;
-        }
         let expected = parse_script_error(row[pos + 3].as_str());
         let Some(verdict) = reduce(expected, &flags) else {
             counts.skipped_policy += 1;
             continue;
         };
-        let (witness, amount) = if pos == 1 {
-            parse_witness(&row[0])
-        } else {
-            (Witness::new(), 0)
-        };
-        let script_sig = parse_script(row[pos].as_str());
-        let script_pubkey = parse_script(row[pos + 1].as_str());
+        let RowInputs {
+            script_sig,
+            script_pubkey,
+            witness,
+            amount,
+        } = parse_row_inputs(row, pos);
         // DoTest adds P2SH and WITNESS to any row that asks for CLEANSTACK.
         let mut run_flags = flags.consensus;
         if flags.has_policy("CLEANSTACK") {
@@ -198,8 +259,8 @@ fn script_tests_json() {
         let result = verify(&script_sig, &script_pubkey, &witness, run_flags, amount);
         assert_eq!(result, verdict, "{row:?}");
         // DoTest's second property: removing flags from a passing row, or adding them to a
-        // failing one, never changes the verdict. Core samples 256 random sets; six flags
-        // have 48 valid combinations, so all of them are tried.
+        // failing one, never changes the verdict. Core samples 256 random sets; seven flags
+        // have 64 valid combinations, so all of them are tried.
         for &combination in &combinations {
             let (applicable, description) = if verdict.is_ok() {
                 (combination.is_subset_of(run_flags), "subset")
@@ -225,10 +286,9 @@ fn script_tests_json() {
         counts,
         ScriptCounts {
             comments: 51,
-            run_ok: 672,
-            run_err: 416,
+            run_ok: 675,
+            run_err: 418,
             skipped_policy: 129,
-            deferred_taproot: 5,
         }
     );
 }
@@ -316,10 +376,10 @@ fn tx_valid_json() {
         };
         // The listed flags are the ones to EXCLUDE; the policy ones among them have nothing
         // to exclude here, and the consensus ones come off the implemented set.
-        let flags = trim_flags(IMPLEMENTED.difference(row.flags.consensus));
+        let flags = trim_flags(ScriptFlags::MANDATORY.difference(row.flags.consensus));
         assert_eq!(check_tx_scripts(&row, flags), Ok(()), "{}", row.text);
         // Removing any one flag keeps a valid transaction valid.
-        for flag in IMPLEMENTED_FLAGS {
+        for flag in MANDATORY_FLAGS {
             let fewer = trim_flags(flags.difference(flag));
             assert_eq!(
                 check_tx_scripts(&row, fewer),
@@ -367,12 +427,12 @@ fn tx_invalid_json() {
         assert!(check_tx_scripts(&row, flags).is_err(), "{}", row.text);
         // Adding flags keeps an invalid transaction invalid.
         assert!(
-            check_tx_scripts(&row, IMPLEMENTED).is_err(),
+            check_tx_scripts(&row, ScriptFlags::MANDATORY).is_err(),
             "under all flags: {}",
             row.text
         );
         // Removing any one listed flag makes it valid: the list is minimal.
-        for flag in IMPLEMENTED_FLAGS {
+        for flag in MANDATORY_FLAGS {
             if !flags.contains(flag) {
                 continue;
             }

@@ -182,6 +182,25 @@ impl Opcode {
         )
     }
 
+    /// Core's `IsOpSuccess`: the opcodes BIP342 reserves for future tapscript upgrades.
+    /// `OP_RESERVED`, `OP_VER`, the disabled opcodes, both `OP_RESERVED1/2`, and every
+    /// byte from `0xbb` to `0xfe`; `OP_VERIF`, `OP_VERNOTIF` and `OP_INVALIDOPCODE` are not
+    /// among them. Meaningful only before a tapscript runs: one makes the spend valid.
+    #[must_use]
+    pub const fn is_success(self) -> bool {
+        matches!(
+            self.0,
+            OP_RESERVED
+                | OP_VER
+                | OP_CAT..=OP_RIGHT
+                | OP_INVERT..=OP_XOR
+                | OP_RESERVED1..=OP_RESERVED2
+                | OP_2MUL..=OP_2DIV
+                | OP_MUL..=OP_RSHIFT
+                | 0xbb..=0xfe
+        )
+    }
+
     /// `OP_IF` through `OP_ENDIF`: dispatched even inside an unexecuted branch, which is why
     /// `OP_VERIF` and `OP_VERNOTIF` fail wherever they appear.
     #[must_use]

@@ -21,10 +21,12 @@ use bitcoin::hashes::Hash;
 use bitcoin::hex::FromHex;
 use bitcoin::transaction::Version;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+use secp256k1::{Scalar, Secp256k1, SecretKey};
 
 use super::num::ScriptNum;
 use super::opcode::{OP_0, OP_1, OP_1NEGATE, PARSER_NAMES};
 use super::reader::push_encoding;
+use super::taproot::{tap_tweak, tapleaf_hash};
 use super::{ScriptError, ScriptFlags};
 
 /// Core's `src/test/data/sighash.json` at v31.1; see `tests/data/README.md`.
@@ -427,6 +429,31 @@ pub fn parse_script_error(name: &str) -> Expected {
         .find(|error| error.name() == name)
         .unwrap_or_else(|| panic!("unknown script error {name}"));
     Expected::Consensus(*error)
+}
+
+/// What `#CONTROLBLOCK#` and `0x51 0x20 #TAPROOTOUTPUT#` stand for in `script_tests.json`:
+/// Core's harness builds a one-leaf tree over the leaf script under `KeyData::key0`, the
+/// secret key `1`, and returns the leaf's control block and the tree's output key. The
+/// leaf version is a parameter so that tests can build an unknown one.
+pub fn taproot_single_leaf(script: &[u8], leaf_version: u8) -> (Vec<u8>, [u8; 32]) {
+    assert_eq!(leaf_version & 1, 0);
+    let secp = Secp256k1::new();
+    let mut key0 = [0u8; 32];
+    key0[31] = 1;
+    let (internal_key, _parity) = SecretKey::from_slice(&key0)
+        .expect("1 is a valid secret key")
+        .x_only_public_key(&secp);
+    // A single leaf is its own Merkle root.
+    let merkle_root = tapleaf_hash(leaf_version, script);
+    let tweak = Scalar::from_be_bytes(tap_tweak(&internal_key.serialize(), &merkle_root))
+        .expect("a hash below the group order, with overwhelming probability");
+    let (output_key, parity) = internal_key
+        .add_tweak(&secp, &tweak)
+        .expect("a tweak that does not cancel the key");
+    let mut control = vec![leaf_version | parity.to_u8()];
+    control.extend(internal_key.serialize());
+    assert_eq!(control.len(), 33);
+    (control, output_key.serialize())
 }
 
 /// `BuildCreditingTransaction`: version 1, one null-prevout input with scriptSig `OP_0 OP_0`,

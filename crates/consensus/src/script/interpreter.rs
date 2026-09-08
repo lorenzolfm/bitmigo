@@ -85,11 +85,6 @@ impl<'a> ExecData<'a> {
 
     /// Execution data for a tapscript leaf.
     #[must_use]
-    #[allow(
-        dead_code,
-        reason = "the taproot verifier that builds one is the next layer; the tapscript \
-                  branches it feeds are tested through this constructor"
-    )]
     pub const fn tapscript(exec: TapscriptExec<'a>) -> ExecData<'a> {
         ExecData {
             codesep_pos: CODESEPARATOR_POS_NONE,

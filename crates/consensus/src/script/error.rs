@@ -89,6 +89,8 @@ pub enum ScriptError {
     SchnorrSigHashtype,
     /// A well-formed Schnorr signature did not verify against the key (BIP340).
     SchnorrSig,
+    /// A control block of other than `33 + 32·m` bytes, `m ≤ 128` (BIP341).
+    TaprootWrongControlSize,
     /// The tapscript sigop budget went negative (BIP342).
     TapscriptValidationWeight,
     /// `CHECKMULTISIG` in tapscript (BIP342).
@@ -139,6 +141,7 @@ impl ScriptError {
             ScriptError::SchnorrSigSize => "SCHNORR_SIG_SIZE",
             ScriptError::SchnorrSigHashtype => "SCHNORR_SIG_HASHTYPE",
             ScriptError::SchnorrSig => "SCHNORR_SIG",
+            ScriptError::TaprootWrongControlSize => "TAPROOT_WRONG_CONTROL_SIZE",
             ScriptError::TapscriptValidationWeight => "TAPSCRIPT_VALIDATION_WEIGHT",
             ScriptError::TapscriptCheckmultisig => "TAPSCRIPT_CHECKMULTISIG",
             ScriptError::TapscriptMinimalif => "TAPSCRIPT_MINIMALIF",
@@ -149,7 +152,7 @@ impl ScriptError {
 
     /// Every variant, in Core's order, for tests that walk the table.
     #[cfg(test)]
-    pub const ALL: [ScriptError; 38] = [
+    pub const ALL: [ScriptError; 39] = [
         ScriptError::EvalFalse,
         ScriptError::Verify,
         ScriptError::Equalverify,
@@ -183,6 +186,7 @@ impl ScriptError {
         ScriptError::SchnorrSigSize,
         ScriptError::SchnorrSigHashtype,
         ScriptError::SchnorrSig,
+        ScriptError::TaprootWrongControlSize,
         ScriptError::TapscriptValidationWeight,
         ScriptError::TapscriptCheckmultisig,
         ScriptError::TapscriptMinimalif,

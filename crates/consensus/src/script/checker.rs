@@ -23,7 +23,8 @@ use super::{ScriptError, SigVersion};
 /// libsecp256k1 verifies against a context. Core uses `secp256k1_context_static`; the Rust
 /// binding exposes no static verifying context, so one is built on first use and shared by
 /// every thread for the life of the process. This is the crate's one lazy allocation.
-static SECP256K1: LazyLock<Secp256k1<VerifyOnly>> = LazyLock::new(Secp256k1::verification_only);
+pub(super) static SECP256K1: LazyLock<Secp256k1<VerifyOnly>> =
+    LazyLock::new(Secp256k1::verification_only);
 
 /// Lock times at or above this are Unix timestamps, below it block heights (BIP65).
 pub const LOCKTIME_THRESHOLD: i64 = 500_000_000;

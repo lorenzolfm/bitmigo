@@ -491,7 +491,7 @@ fn taproot_encode_input(
 
 /// Consensus-serialises `value` into a hash engine. An engine accepts every write, so the
 /// `io::Result` is an invariant, not an error.
-fn encode<E: Encodable + ?Sized>(engine: &mut sha256::HashEngine, value: &E) {
+pub(super) fn encode<E: Encodable + ?Sized>(engine: &mut sha256::HashEngine, value: &E) {
     let written = value
         .consensus_encode(engine)
         .expect("a hash engine accepts every write");
@@ -525,7 +525,7 @@ fn sha256_once(bytes: &[u8; 32]) -> [u8; 32] {
     sha256::Hash::hash(bytes).to_byte_array()
 }
 
-fn count_to_u64(count: usize) -> u64 {
+pub(super) fn count_to_u64(count: usize) -> u64 {
     u64::try_from(count).expect("a count of transaction parts fits u64")
 }
 
