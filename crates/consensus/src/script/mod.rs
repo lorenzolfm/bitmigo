@@ -30,8 +30,9 @@ mod stack;
 mod taproot;
 #[cfg(test)]
 mod vector_tests;
+// The JSON reader and the PRNG serve the other modules' tests too.
 #[cfg(test)]
-mod vectors;
+pub(crate) mod vectors;
 mod verify;
 
 pub use checker::TxSigChecker;

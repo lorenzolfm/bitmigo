@@ -11,12 +11,14 @@
 //!
 //! Rules land one module at a time, each with its tests. [`params`] says what a chain is and
 //! which rules apply to a block at a height; [`script`] is the script interpreter, from the
-//! signature hashes up to `verify_script`.
+//! signature hashes up to `verify_script`; [`header`] is proof of work, retargeting and the
+//! two header stages, `check_header` and `accept_header`, over the shared `Context`.
 
 // The purity tripwire in `clippy.toml` is a hard error here, not a warning like the rest of
 // clippy: reaching for the disk or the network from consensus is a design bug, not style.
 #![deny(clippy::disallowed_types, clippy::disallowed_methods)]
 
+pub mod header;
 pub mod params;
 pub mod script;
 
