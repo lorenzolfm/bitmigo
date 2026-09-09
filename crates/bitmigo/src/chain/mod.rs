@@ -18,7 +18,7 @@
 //! And it publishes its summary of itself rather than letting anything read its state.
 
 #[cfg(test)]
-mod fixture;
+pub mod fixture;
 mod locator;
 mod reorg;
 mod tree;
@@ -29,6 +29,7 @@ use bitcoin::block::Header;
 use bitcoin::p2p::message::NetworkMessage;
 use bitmigo_consensus::params::BlockTime;
 
+use crate::download::{HeadersReceived, Schedule};
 use crate::peer::{Disconnect, MAX_HEADERS_ITEMS, SlotIndex};
 use crate::runtime::Shared;
 use crate::runtime::queue::{PeerMessage, Received};
@@ -37,14 +38,15 @@ use crate::runtime::queue::{PeerMessage, Received};
 // path, the chainstate, the download schedule and the block server — reach one place.
 #[allow(
     unused_imports,
-    reason = "re-exported for BM-9, BM-10, BM-23 and BM-24; the thread below uses a few"
+    reason = "re-exported for BM-9, BM-10 and BM-24; the chain thread and the \
+              download schedule use a few"
 )]
 pub use locator::MAX_LOCATOR_ENTRIES;
-#[allow(unused_imports, reason = "the plan is handed to validation by BM-23")]
+#[allow(unused_imports, reason = "the plan is handed to validation by BM-10")]
 pub use reorg::{REORG_WARNING_DEPTH, Reorg};
 #[allow(
     unused_imports,
-    reason = "the tree's states and verdicts are read by BM-9, BM-10 and BM-23"
+    reason = "the tree's states and verdicts are read by BM-9 and BM-10"
 )]
 pub use tree::{
     AcceptError, Accepted, HeaderEntry, HeaderStatus, HeaderTree, Invalidity, MAX_TREE_HEADERS,
@@ -58,19 +60,23 @@ const CHAIN_TICK: Duration = Duration::from_millis(250);
 /// Run until the node stops.
 pub fn run(shared: &Shared) {
     let mut tree = HeaderTree::new(&shared.params);
+    let mut schedule = Schedule::new(shared);
     let mut received: u64 = 0;
     let mut reorg_depth: usize = 0;
-    publish(shared, &tree, reorg_depth);
+    publish(shared, &tree, &schedule, reorg_depth);
     while !shared.shutdown.is_begun() {
         match shared.to_chain.recv(CHAIN_TICK) {
             Received::Item(message) => {
                 received = received.saturating_add(1);
-                record(shared, &mut tree, message);
+                record(shared, &mut tree, &mut schedule, message);
             }
             Received::Empty => {}
             Received::Closed => break,
         }
-        let depth = schedule(shared, &mut tree);
+        // What to ask for next, of whom, and who has stopped answering: one pass per turn
+        // of this loop, message or no message.
+        schedule.tick(shared, &mut tree);
+        let depth = plan(shared, &mut tree);
         // Said once per reorg rather than once per tick: the plan stands until validation
         // has worked through it, and an operator warned four times a second is not warned.
         if depth >= REORG_WARNING_DEPTH && depth != reorg_depth {
@@ -78,15 +84,16 @@ pub fn run(shared: &Shared) {
             println!("bitmigo: reorg {depth} blocks deep, active chain rewinds past {fork}");
         }
         reorg_depth = depth;
-        publish(shared, &tree, reorg_depth);
+        publish(shared, &tree, &schedule, reorg_depth);
     }
     flush(shared);
     // Validation stops when the shutdown is announced, but closing the queue behind it says
     // so plainly: nothing further will be scheduled.
     shared.to_validation.close();
     println!(
-        "bitmigo: chain stopped after {received} messages, {} headers",
-        tree.len()
+        "bitmigo: chain stopped after {received} messages, {} headers, {}",
+        tree.len(),
+        schedule.summary(),
     );
 }
 
@@ -101,14 +108,25 @@ pub fn run(shared: &Shared) {
     reason = "the queue hands ownership over, and the block arm takes it: a block's raw \
               bytes are written to the store exactly as they arrived, which is BM-9's"
 )]
-fn record(shared: &Shared, tree: &mut HeaderTree, message: PeerMessage) {
-    // Everything but a `headers` waits on the module that owns it. A `block` goes to the
-    // store, whose location is what moves a header to `BlockChecked` (BM-9). A `getheaders`
-    // is answered from `HeaderTree::headers_after` by the block server (BM-24). An `inv`, a
-    // `getdata`, a `notfound` and the address messages are the download schedule's and the
-    // discovery's (BM-23).
-    if let NetworkMessage::Headers(headers) = &message.message {
-        headers_received(shared, tree, message.peer, headers);
+fn record(shared: &Shared, tree: &mut HeaderTree, schedule: &mut Schedule, message: PeerMessage) {
+    let peer = message.peer;
+    match message.message {
+        NetworkMessage::Headers(headers) => {
+            let received = headers_received(shared, tree, peer, &headers);
+            schedule.headers_answered(shared, tree, peer, received);
+        }
+        // The hash is computed again here rather than carried on the queue: eighty bytes of
+        // `sha256d` beside the merkle root the reader thread has already paid for, and one
+        // less field that could disagree with the block beside it. The bytes themselves go
+        // to the store, whose location is what moves a header to `BlockChecked` (BM-9).
+        NetworkMessage::Block(block) => schedule.block_received(shared, peer, block.block_hash()),
+        NetworkMessage::Inv(items) => schedule.announced(shared, tree, peer, &items),
+        // A `getheaders` is answered from `HeaderTree::headers_after` and a `getdata` from
+        // the block store, both by the block server (BM-24). A `notfound` naming a block is
+        // ignored exactly as Core ignores it: the request stays in flight, and the download
+        // timeout is what ends a peer that answers that way. The address messages wait on
+        // the address manager the map still holds open.
+        _ => {}
     }
 }
 
@@ -119,20 +137,42 @@ fn record(shared: &Shared, tree: &mut HeaderTree, message: PeerMessage) {
 /// every header after it is unconnected. A peer answers for its own fault and nothing else
 /// (BM-D1 decision 6), and nothing here writes a line to the log — a peer that can make
 /// this node print is a peer that has been handed a megaphone.
-fn headers_received(shared: &Shared, tree: &mut HeaderTree, peer: SlotIndex, headers: &[Header]) {
+fn headers_received(
+    shared: &Shared,
+    tree: &mut HeaderTree,
+    peer: SlotIndex,
+    headers: &[Header],
+) -> HeadersReceived {
     assert!(headers.len() <= MAX_HEADERS_ITEMS, "the framer bounds this");
     let now = node_time();
+    let mut received = HeadersReceived {
+        count: headers.len(),
+        last: None,
+        unconnecting: false,
+    };
     for header in headers {
-        let Err(error) = tree.accept(header, &shared.params, now) else {
-            continue;
+        let error = match tree.accept(header, &shared.params, now) {
+            // A duplicate counts: the peer has said it has this block, which is what the
+            // download schedule reads off the last header of a batch.
+            Ok(accepted) => {
+                received.last = Some(accepted.node());
+                continue;
+            }
+            Err(error) => error,
         };
+        // Core's `HandleUnconnectingHeaders`: a first header whose parent this node has
+        // never seen is a peer that is ahead of us, not a peer at fault. The schedule
+        // answers it with a `getheaders` from this node's own best header.
+        received.unconnecting =
+            received.last.is_none() && matches!(error, AcceptError::UnknownParent { .. });
         if let Some(fault) = error.peer_fault()
             && let Some(connection) = shared.slots.connection(peer)
         {
             connection.disconnect(Disconnect::InvalidHeader(fault));
         }
-        return;
+        return received;
     }
+    received
 }
 
 /// Top the connect queue up while the connectable prefix advances and there is room.
@@ -141,12 +181,13 @@ fn headers_received(shared: &Shared, tree: &mut HeaderTree, peer: SlotIndex, hea
 /// plan is [`HeaderTree::reorg`], bounded by the room there is, so a reorg of any depth is
 /// worked through a batch at a time and never built as one list.
 ///
-/// Handing the jobs over is BM-23's, and deliberately not done here: a job that has been
-/// queued and not yet applied is in-flight state, and the thread that hands it over is the
-/// one that must know when it has landed. That report comes back with the chainstate
-/// (BM-10), which is also what supplies the undo record a block needs to become
-/// [`HeaderStatus::Connected`]. Returns the depth of the reorg the plan describes.
-fn schedule(shared: &Shared, tree: &mut HeaderTree) -> usize {
+/// Handing the jobs over waits on the chainstate (BM-10), and deliberately: a job that has
+/// been queued and not yet applied is in-flight state, and the thread that hands it over is
+/// the one that must know when it has landed. Nothing reports a connect back yet, and a
+/// hand-off with no report is a hand-off that would queue the same block over and over.
+/// BM-10 brings the report, and the undo record a block needs to become
+/// [`HeaderStatus::Connected`], together. Returns the depth of the reorg the plan describes.
+fn plan(shared: &Shared, tree: &mut HeaderTree) -> usize {
     let room = shared.to_validation.room();
     if room == 0 {
         return 0;
@@ -156,7 +197,7 @@ fn schedule(shared: &Shared, tree: &mut HeaderTree) -> usize {
 }
 
 /// Publish what an operator may see: never the thread's own state, always a copy of it.
-fn publish(shared: &Shared, tree: &HeaderTree, reorg_depth: usize) {
+fn publish(shared: &Shared, tree: &HeaderTree, schedule: &Schedule, reorg_depth: usize) {
     let mut status = shared.status.read();
     status.peers = shared
         .slots
@@ -173,6 +214,8 @@ fn publish(shared: &Shared, tree: &HeaderTree, reorg_depth: usize) {
     status.header_height = best.height();
     status.header_work = best.chainwork();
     status.last_reorg_depth = reorg_depth;
+    status.blocks_in_flight = schedule.blocks_in_flight();
+    status.initial_block_download = schedule.is_initial_block_download();
     shared.status.publish(status);
 }
 
@@ -181,7 +224,7 @@ fn publish(shared: &Shared, tree: &HeaderTree, reorg_depth: usize) {
 /// The one rule in the header stages that needs a clock, which is why the consensus crate
 /// leaves a hole where Core runs it. A clock that reads before the epoch is broken, and the
 /// safe direction for a broken clock is to accept nothing rather than everything.
-fn node_time() -> BlockTime {
+pub fn node_time() -> BlockTime {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());

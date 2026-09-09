@@ -4,9 +4,11 @@
 //! thread that puts a socket into one and the two threads that were already waiting on it.
 
 use std::net::{Shutdown, SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+use bitcoin::p2p::ServiceFlags;
 
 use super::discovery::netgroup;
 use super::{
@@ -123,6 +125,10 @@ pub struct Connection {
     /// Whether the handshake is through. The reader owns the exchange; this is how every
     /// other thread finds out, without asking the reader anything.
     ready: Arc<AtomicBool>,
+    /// What the peer said it offers, written by the reader as it reads the `version` and
+    /// before the connection is marked ready, so a ready connection always has them. The
+    /// download schedule reads them to decide whether this peer can serve a block at all.
+    services: Arc<AtomicU64>,
     /// Why the connection ended, set by whichever thread decided. First writer wins: a
     /// write that failed is why the read that follows it returns nothing.
     ended: Arc<Mutex<Option<Disconnect>>>,
@@ -131,11 +137,6 @@ pub struct Connection {
 impl Connection {
     /// Whether the `version`/`verack` exchange has completed. Until it has, this node
     /// neither asks the peer for anything nor answers it anything.
-    #[allow(
-        dead_code,
-        reason = "the reader sets it; the download scheduler and the block server are the \
-                  threads that will read it, and they are BM-23 and BM-24"
-    )]
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::SeqCst)
     }
@@ -143,6 +144,16 @@ impl Connection {
     /// Say the exchange is through. The reader thread's to call, once.
     pub fn mark_ready(&self) {
         self.ready.store(true, Ordering::SeqCst);
+    }
+
+    /// What the peer offers. `NONE` until its `version` has been read.
+    pub fn services(&self) -> ServiceFlags {
+        ServiceFlags::from(self.services.load(Ordering::SeqCst))
+    }
+
+    /// Record what the peer offered. The reader thread's to call, before `mark_ready`.
+    pub fn set_services(&self, services: ServiceFlags) {
+        self.services.store(services.to_u64(), Ordering::SeqCst);
     }
 
     /// End the connection from any thread, saying why.
@@ -273,6 +284,7 @@ impl PeerSlots {
                 outbox: Arc::new(Outbox::with_bound(OUTBOX_MAX_BYTES)),
                 requests: Arc::new(Requests::new()),
                 ready: Arc::new(AtomicBool::new(false)),
+                services: Arc::new(AtomicU64::new(ServiceFlags::NONE.to_u64())),
                 ended: Arc::new(Mutex::new(None)),
             });
             drop(state);
@@ -400,6 +412,19 @@ impl PeerSlots {
         }
         assert!(addresses.len() <= BLOCK_RELAY_SLOTS);
         addresses
+    }
+
+    /// Backdate a connection, so that a test can reach the rules that apply only to one
+    /// that has been up for a while — Core's `MINIMUM_CONNECT_TIME` among them.
+    #[cfg(test)]
+    pub fn backdate(&self, index: SlotIndex, by: Duration) {
+        let Some(slot) = self.slot(index) else {
+            return;
+        };
+        let mut state = lock(&slot.state);
+        if let Some(connection) = state.as_mut() {
+            connection.since = connection.since.checked_sub(by).unwrap_or(connection.since);
+        }
     }
 
     /// Whether the table has been closed.

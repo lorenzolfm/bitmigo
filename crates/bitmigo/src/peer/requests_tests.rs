@@ -81,16 +81,6 @@ fn the_same_block_is_not_asked_of_the_same_peer_twice() {
     assert_eq!(requests.outstanding(), 1);
 }
 
-#[test]
-fn the_oldest_request_is_the_one_a_stall_is_measured_from() {
-    let requests = Requests::new();
-    assert!(requests.oldest().is_none());
-    let first = request(1);
-    assert!(requests.record(first));
-    assert!(requests.record(request(2)));
-    assert_eq!(requests.oldest(), Some(first.requested_at));
-}
-
 /// A connection ending gives its blocks back to the scheduler rather than losing them.
 #[test]
 fn ending_a_connection_gives_the_blocks_back() {

@@ -28,16 +28,12 @@ use crate::peer::{MAX_HEADERS_ITEMS, MAX_LOCATOR_ITEMS};
 /// it, then genesis: thirty-three at a tree of [`crate::chain::MAX_TREE_HEADERS`], and
 /// fewer on any real chain. Core reserves thirty-two for the same list and refuses one of
 /// more than [`MAX_LOCATOR_ITEMS`] on receipt, so this stays far inside what a peer accepts.
-#[allow(
-    dead_code,
-    reason = "the locators this bounds are built by BM-23 and BM-24"
-)]
 pub const MAX_LOCATOR_ENTRIES: usize = 40;
 
 #[allow(
     dead_code,
-    reason = "the download schedule builds locators (BM-23) and the block server answers \
-              getheaders from them (BM-24); both read this, and both are tested here first"
+    reason = "the download schedule builds the locators; answering a peer's getheaders \
+              from one is the block server's, BM-24, and is tested here ahead of it"
 )]
 impl HeaderTree {
     /// The locator for a node's chain, in Core's shape.

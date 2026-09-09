@@ -454,7 +454,6 @@ pub enum Accepted {
 impl Accepted {
     /// Where the header is.
     #[must_use]
-    #[allow(dead_code, reason = "the download schedule requests this block: BM-23")]
     pub fn node(self) -> NodeId {
         match self {
             Accepted::First { node, .. } | Accepted::Duplicate { node } => node,

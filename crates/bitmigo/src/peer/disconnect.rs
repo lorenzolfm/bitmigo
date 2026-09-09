@@ -73,6 +73,18 @@ pub enum Disconnect {
     InvalidHeader(HeaderError),
     /// A block that failed `check_block` or `accept_block`.
     InvalidBlock(BlockError),
+    /// The peer took a `getdata` and did not answer it inside
+    /// `nPowTargetSpacing * (1 + 0.5 * other peers downloading)`.
+    BlockDownloadTimeout,
+    /// The peer is holding the left edge of the download window while every other peer has
+    /// run out of blocks to fetch. Core's "Peer is stalling block download".
+    BlockStalling,
+    /// The peer took the headers sync and stopped answering, while still answering pings —
+    /// which is why no other timer here can see it.
+    HeadersTimeout,
+    /// This node's tip has not moved and its outbound slots are full, so the peer that has
+    /// told it least about the chain makes way for one it has not spoken to yet.
+    StaleTip,
     /// The peer stopped reading and its megabyte of queued replies filled up.
     OutboxFull,
     /// A write did not complete inside `SO_SNDTIMEO`, or the socket failed.
@@ -105,6 +117,10 @@ impl Disconnect {
             | Self::HandshakeTimeout
             | Self::PingTimeout
             | Self::Silent
+            | Self::BlockDownloadTimeout
+            | Self::BlockStalling
+            | Self::HeadersTimeout
+            | Self::StaleTip
             | Self::OutboxFull
             | Self::WriteFailed
             | Self::PeerClosed
@@ -145,6 +161,10 @@ impl std::fmt::Display for Disconnect {
             Self::UnrequestedBlock { hash } => write!(f, "unrequested block {hash}"),
             Self::InvalidHeader(error) => write!(f, "{error}"),
             Self::InvalidBlock(error) => write!(f, "{error}"),
+            Self::BlockDownloadTimeout => f.write_str("timeout downloading block"),
+            Self::BlockStalling => f.write_str("stalling block download"),
+            Self::HeadersTimeout => f.write_str("timeout downloading headers"),
+            Self::StaleTip => f.write_str("stale tip, making way for a new peer"),
             Self::OutboxFull => f.write_str("send buffer full"),
             Self::WriteFailed => f.write_str("write failed"),
             Self::PeerClosed => f.write_str("peer closed the connection"),

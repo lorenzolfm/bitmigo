@@ -57,6 +57,10 @@ fn every_reason() -> Vec<Disconnect> {
         Disconnect::InvalidBlock(BlockError::BadMerkleRoot {
             computed: [0u8; 32],
         }),
+        Disconnect::BlockDownloadTimeout,
+        Disconnect::BlockStalling,
+        Disconnect::HeadersTimeout,
+        Disconnect::StaleTip,
         Disconnect::OutboxFull,
         Disconnect::WriteFailed,
         Disconnect::PeerClosed,
@@ -105,6 +109,12 @@ fn only_a_peer_that_earned_it_is_blamed() {
     assert!(!Disconnect::PingTimeout.misbehaving());
     assert!(!Disconnect::HandshakeTimeout.misbehaving());
     assert!(!Disconnect::OutboxFull.misbehaving());
+    // Every download verdict is about this node's own patience, not about the peer's
+    // honesty: a peer that is slow, or that this node makes way past, has broken no rule.
+    assert!(!Disconnect::BlockDownloadTimeout.misbehaving());
+    assert!(!Disconnect::BlockStalling.misbehaving());
+    assert!(!Disconnect::HeadersTimeout.misbehaving());
+    assert!(!Disconnect::StaleTip.misbehaving());
     assert!(!Disconnect::WriteFailed.misbehaving());
     assert!(!Disconnect::ConnectedToSelf.misbehaving());
     assert!(

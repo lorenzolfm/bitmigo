@@ -161,11 +161,6 @@ impl Network {
     /// Held as a `u128` because it is one: mainnet's chain work is around 2^95 and the
     /// figure Core ships is smaller still, so the top sixteen bytes are zero and will stay
     /// zero for longer than this code will exist.
-    #[allow(
-        dead_code,
-        reason = "BM-D3 decision 6 puts the value here; the scheduler that applies it is \
-                  BM-23's, and refuses block requests from a peer below it"
-    )]
     pub fn minimum_chain_work(&self) -> [u8; 32] {
         let mut work = [0u8; 32];
         let low = self.minimum_chain_work.to_be_bytes();

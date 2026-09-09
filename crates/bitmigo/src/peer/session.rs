@@ -132,6 +132,9 @@ impl<'a> Session<'a> {
             return Ok(());
         }
         if !was_ready {
+            // The services first: a thread that sees a ready connection must be able to
+            // read what the peer offers without asking this one anything.
+            self.connection.set_services(self.handshake.peer_services());
             self.connection.mark_ready();
             println!(
                 "bitmigo: peer {} ready: {} ({}) at {}",

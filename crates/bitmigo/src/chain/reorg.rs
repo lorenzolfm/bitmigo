@@ -42,8 +42,8 @@ pub struct Reorg {
 
 #[allow(
     dead_code,
-    reason = "the chain thread reads the depth; handing the jobs over is BM-23's, and the \
-              missing block is the cue it schedules from"
+    reason = "the chain thread reads the depth; handing the jobs over waits on the \
+              report that comes back with the chainstate, which is BM-10's"
 )]
 impl Reorg {
     /// The last block the active chain and the target chain share.

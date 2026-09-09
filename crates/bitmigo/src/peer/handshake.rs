@@ -220,11 +220,6 @@ impl Handshake {
     }
 
     /// What the peer said it offers. Meaningless before its `version` arrives.
-    #[allow(
-        dead_code,
-        reason = "Core's `CanServeBlocks` and `CanServeWitnesses` read this; the scheduler \
-                  that asks them is BM-23"
-    )]
     pub fn peer_services(&self) -> ServiceFlags {
         self.peer_services
     }

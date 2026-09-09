@@ -18,7 +18,10 @@
 //! `check_block` and `accept_block` without touching a single piece of shared state.
 //!
 //! Filling this table is the download scheduler's work. What lives here is the table, the
-//! bound on it, and the two rules the reader thread reads off it.
+//! bound on it, and the two rules the reader thread reads off it. When a request became the
+//! oldest one outstanding is the scheduler's own bookkeeping and not a question for this
+//! table: Core measures its block download timeout from the moment a block reached the head
+//! of the list, not from the moment it was asked for.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -70,10 +73,6 @@ impl Requests {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "the reader reads this table; the scheduler that fills it is BM-23"
-    )]
     /// Record a request. Refuses past the bound, and refuses a block already asked of this
     /// peer: both would be this node's own scheduling bug, and neither is worth the state.
     pub fn record(&self, request: BlockRequest) -> bool {
@@ -99,15 +98,6 @@ impl Requests {
     /// How many blocks this peer owes. Zero is what makes its read cap the idle one.
     pub fn outstanding(&self) -> usize {
         lock(&self.outstanding).len()
-    }
-
-    /// When the oldest outstanding request was made, which is what a stall is measured
-    /// from. The scheduler owns the timeout itself.
-    #[allow(dead_code, reason = "the adaptive 2-64 s stall timeout is BM-23's")]
-    pub fn oldest(&self) -> Option<Instant> {
-        lock(&self.outstanding)
-            .front()
-            .map(|held| held.requested_at)
     }
 
     /// Give up on everything asked of this peer: the connection has ended, and the blocks
