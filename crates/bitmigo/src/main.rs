@@ -9,12 +9,14 @@
 //! rather than leaving it to crash recovery.
 //!
 //! ```text
-//! bitmigo [listen address]
+//! bitmigo [listen address] [peer address ...]
 //! ```
 //!
-//! The address defaults to regtest's port on the loopback. Flags, a configuration file, a
-//! data directory and a choice of chain are the operator surface, and they are not settled
-//! yet; this is the smallest thing that lets the node be started and stopped.
+//! The address defaults to regtest's port on the loopback, and the peers are bitcoind's
+//! `-addnode`: on regtest there are no DNS seeds and nothing to gossip, so somebody has to
+//! say where the other node is. Flags, a configuration file, a data directory and a choice
+//! of chain are the operator surface, and they are not settled yet; this is the smallest
+//! thing that lets the node be started, pointed at a peer, and stopped.
 
 mod chain;
 mod control;
@@ -26,7 +28,7 @@ use std::io;
 use std::process::ExitCode;
 
 use crate::runtime::signal::SignalPipe;
-use crate::runtime::{Config, Runtime, THREAD_COUNT};
+use crate::runtime::{Config, Runtime};
 
 fn main() -> ExitCode {
     match start() {
@@ -45,11 +47,8 @@ fn start() -> io::Result<()> {
     // Before any thread exists: a handler that fires while the table is half-built would
     // have a self-pipe nobody is reading yet.
     let pipe = SignalPipe::install()?;
+    // The node says where it is listening as it binds, before any thread exists.
     let runtime = Runtime::start(&config, pipe)?;
-    println!(
-        "bitmigo: listening on {}, {THREAD_COUNT} threads",
-        runtime.listen_address(),
-    );
 
     let cause = runtime.wait();
     println!("bitmigo: stopping on {cause}");
@@ -58,7 +57,7 @@ fn start() -> io::Result<()> {
     Ok(())
 }
 
-/// Read the one argument there is.
+/// Read the arguments there are: where to listen, then who to dial.
 fn configure(mut arguments: impl Iterator<Item = String>) -> io::Result<Config> {
     let mut config = Config::default();
     if let Some(listen) = arguments.next() {
@@ -69,11 +68,20 @@ fn configure(mut arguments: impl Iterator<Item = String>) -> io::Result<Config> 
             )
         })?;
     }
-    if let Some(unexpected) = arguments.next() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("unexpected argument: {unexpected}"),
-        ));
+    for peer in arguments {
+        let address = peer.parse().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("not a peer to dial: {peer}"),
+            )
+        })?;
+        if config.peers.contains(&address) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("peer named twice: {peer}"),
+            ));
+        }
+        config.peers.push(address);
     }
     Ok(config)
 }
@@ -101,4 +109,35 @@ mod tests {
         assert!(configure(["not-an-address".to_owned()].into_iter()).is_err());
         assert!(configure(["127.0.0.1:0".to_owned(), "--flag".to_owned()].into_iter()).is_err());
     }
+
+    #[test]
+    fn the_rest_of_the_arguments_are_peers_to_dial() {
+        let config = configure(
+            [
+                "127.0.0.1:0".to_owned(),
+                "127.0.0.1:18444".to_owned(),
+                "127.0.0.1:18445".to_owned(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(config.peers.len(), 2);
+        assert_eq!(config.peers.first().copied(), Some(PEER));
+
+        // Named twice is a mistake, and the runtime asserts on it: catching it here is what
+        // keeps that assertion unreachable from the command line.
+        let twice = configure(
+            [
+                "127.0.0.1:0".to_owned(),
+                "127.0.0.1:18444".to_owned(),
+                "127.0.0.1:18444".to_owned(),
+            ]
+            .into_iter(),
+        );
+        assert!(twice.is_err());
+    }
+
+    /// The address the tests above dial.
+    const PEER: SocketAddr =
+        SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 18_444);
 }

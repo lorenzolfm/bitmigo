@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn jobs_are_pulled_and_the_utxo_summary_follows_them() {
-        let shared = Arc::new(Shared::new(Chain::Regtest));
+        let shared = Arc::new(Shared::testing(Chain::Regtest));
         let running = Arc::clone(&shared);
         let validation = Builder::new()
             .name("validation".to_owned())
@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn a_shutdown_leaves_the_queued_blocks_for_the_next_start() {
-        let shared = Arc::new(Shared::new(Chain::Regtest));
+        let shared = Arc::new(Shared::testing(Chain::Regtest));
         // Announced before the thread starts, so nothing is taken off the queue at all.
         shared.shutdown.begin(Cause::Internal("test"));
         for height in 1..=4 {

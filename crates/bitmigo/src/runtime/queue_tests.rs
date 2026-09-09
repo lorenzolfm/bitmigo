@@ -7,22 +7,22 @@ use std::thread::{self, Builder};
 use std::time::Duration;
 
 use bitcoin::hashes::Hash;
+use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::{BlockHash, CompactTarget};
 use bitmigo_consensus::header::Context;
 use bitmigo_consensus::params::{BlockTime, ChainParams, Height, RegtestOverrides};
 
 use super::{
     BlockLocation, ChainToValidation, Closed, ConnectJob, JobKind, PeerMessage, PeerToChain,
-    Received, Sent,
+    Received, Sent, Weighed,
 };
 use crate::peer::{READER_THREAD_PREFIX, SlotIndex};
 
 /// A message of `bytes` payload from slot zero.
 fn message(bytes: usize) -> PeerMessage {
-    PeerMessage {
-        peer: SlotIndex::new(0),
-        bytes: vec![0u8; bytes],
-    }
+    // The weight of a message that is not a block is what it took on the wire, so a test
+    // that wants an item of a size can ask for one.
+    PeerMessage::new(SlotIndex::new(0), NetworkMessage::Ping(0), bytes)
 }
 
 /// A job for a block at `height`, with a regtest context.
@@ -92,7 +92,10 @@ fn the_item_bound_stops_a_queue_of_small_messages_before_the_byte_bound_does() {
     }
     assert!(queue.try_send(message(1)).is_err());
     assert_eq!(queue.len(), 8);
-    assert!(queue.bytes() < 1024);
+    // Eight one-byte messages, and what they weigh is eight times a `PeerMessage`: the
+    // struct's own footprint is part of what the queue holds, so the item bound binds long
+    // before the byte bound gets near a megabyte.
+    assert!(queue.bytes() < 1024 * 1024);
 }
 
 #[test]
@@ -141,8 +144,11 @@ fn an_item_larger_than_the_queue_is_a_programming_error() {
 
 #[test]
 fn an_item_at_the_bound_still_goes_through_an_empty_queue() {
-    let queue: PeerToChain<PeerMessage> = PeerToChain::with_bounds(4096, 16);
-    assert_eq!(queue.send(message(4000)), Ok(Sent::Immediately));
+    // Exactly the bound: an item that fits nowhere else must still go through an empty
+    // queue, or its sender waits for a drain that can never come.
+    let item = message(4000);
+    let queue: PeerToChain<PeerMessage> = PeerToChain::with_bounds(item.byte_len(), 16);
+    assert_eq!(queue.send(item), Ok(Sent::Immediately));
 }
 
 #[test]

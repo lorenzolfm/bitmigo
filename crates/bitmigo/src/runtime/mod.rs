@@ -40,14 +40,16 @@ pub mod sync;
 
 use std::io;
 use std::net::{SocketAddr, TcpListener};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bitmigo_consensus::params::Chain;
+use bitmigo_consensus::block::signet::default_challenge;
+use bitmigo_consensus::params::{Chain, ChainParams, RegtestOverrides};
 
 use crate::peer::{
-    PEER_SLOTS, PEER_THREAD_STACK_BYTES, PeerSlots, READER_THREAD_PREFIX, SlotIndex,
-    WRITER_THREAD_PREFIX,
+    Candidates, MAX_ANCHORS, Network, PEER_SLOTS, PEER_THREAD_STACK_BYTES, PeerSlots,
+    READER_THREAD_PREFIX, SlotIndex, WRITER_THREAD_PREFIX,
 };
 use crate::runtime::queue::{ChainToValidation, PeerMessage, PeerToChain};
 use crate::runtime::signal::{Cause, Shutdown, SignalPipe};
@@ -126,16 +128,21 @@ pub const THREAD_COUNT: usize = 5 + PEER_SLOTS + PEER_SLOTS;
 
 const _: () = assert!(THREAD_COUNT == 69);
 
-/// What the operator gives the node. The flags, the configuration file and the data
-/// directory that will fill this in are the operator surface, which is not settled yet; the
-/// defaults are regtest's, because that is the only chain the node can currently be pointed
-/// at.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What the operator gives the node. The flags and the configuration file that will fill
+/// this in are the operator surface, which is not settled yet; the defaults are regtest's,
+/// because that is the only chain the node can currently be pointed at.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     /// Where to accept connections.
     pub listen: SocketAddr,
     /// Which chain.
     pub chain: Chain,
+    /// Where this node's own files live. One directory per chain below it, so that a node
+    /// pointed at signet cannot read regtest's anchors.
+    pub data_dir: PathBuf,
+    /// Peers to dial before anything else. bitcoind spells this `-addnode`; on regtest,
+    /// where there are no seeds and nothing to gossip, it is the only way in.
+    pub peers: Vec<SocketAddr>,
     /// How long the threads that hold no persistent state get to notice a shutdown.
     pub join_deadline: Duration,
 }
@@ -145,8 +152,37 @@ impl Default for Config {
         Config {
             listen: SocketAddr::from(([127, 0, 0, 1], 18_444)),
             chain: Chain::Regtest,
+            data_dir: default_data_dir(),
+            peers: Vec::new(),
             join_deadline: supervisor::JOIN_DEADLINE,
         }
+    }
+}
+
+/// Where a node's files go when nobody has said otherwise: the XDG data directory, or the
+/// place it defaults to. A stand-in until the operator surface is settled — what it must
+/// not be is the working directory, which is wherever somebody happened to be standing.
+fn default_data_dir() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+        return PathBuf::from(xdg).join("bitmigo");
+    }
+    match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home).join(".local/share/bitmigo"),
+        None => PathBuf::from(".bitmigo"),
+    }
+}
+
+/// The consensus parameters for a chain named on the command line.
+///
+/// A custom signet challenge and regtest's activation-height overrides are both operator
+/// surface: bitcoind spells them `-signetchallenge` and `-testactivationheight`, and BM-D3
+/// settled that this node mirrors those spellings. Until there are flags to carry them,
+/// every chain gets its defaults.
+pub fn params_for(chain: Chain) -> ChainParams {
+    match chain {
+        Chain::Mainnet => ChainParams::mainnet(),
+        Chain::Signet => ChainParams::signet(default_challenge()),
+        Chain::Regtest => ChainParams::regtest(RegtestOverrides::default()),
     }
 }
 
@@ -156,8 +192,15 @@ impl Default for Config {
 pub struct Shared {
     /// The node is stopping, and why.
     pub shutdown: Shutdown,
+    /// The rules every thread validates against. Immutable for the life of the process.
+    pub params: ChainParams,
+    /// The chain's magic, port, seeds and minimum chain work: what the consensus crate
+    /// deliberately does not carry.
+    pub network: Network,
     /// The thirty-two connection slots.
     pub slots: PeerSlots,
+    /// Where to dial next, and the anchors from the last clean stop.
+    pub candidates: Candidates,
     /// Peer readers to the chain thread. The only queue with a blocking send.
     pub to_chain: PeerToChain<PeerMessage>,
     /// The chain thread to the validation thread. Pulled, never pushed against a full queue.
@@ -170,15 +213,32 @@ pub struct Shared {
 
 impl Shared {
     /// The shared state of a node that has just started.
-    pub fn new(chain: Chain) -> Shared {
+    pub fn new(params: ChainParams, data_dir: &Path) -> Shared {
+        let network = Network::of(&params);
+        let chain = params.chain();
+        let directory = data_dir.join(network.directory());
         Shared {
             shutdown: Shutdown::new(),
+            candidates: Candidates::new(&network, &directory),
+            params,
+            network,
             slots: PeerSlots::new(),
             to_chain: PeerToChain::new(),
             to_validation: ChainToValidation::new(),
             status: Published::new(StatusSnapshot::starting(chain)),
             utxoset: Published::new(UtxoSetSnapshot::empty()),
         }
+    }
+}
+
+#[cfg(test)]
+impl Shared {
+    /// Shared state for a test, on a chain and a data directory outside the source tree.
+    pub fn testing(chain: Chain) -> Shared {
+        Shared::new(
+            params_for(chain),
+            &std::env::temp_dir().join("bitmigo-tests"),
+        )
     }
 }
 
@@ -203,7 +263,17 @@ impl Runtime {
         );
         let socket = TcpListener::bind(config.listen)?;
         let listen = socket.local_addr()?;
-        let shared = Arc::new(Shared::new(config.chain));
+        // Said here rather than by the caller, and before a thread exists: a peer can
+        // connect the instant the listener starts, and a node whose first line is a peer's
+        // arrival is a node nothing can tell where it is listening.
+        println!("bitmigo: listening on {listen}, {THREAD_COUNT} threads");
+        let shared = Arc::new(Shared::new(params_for(config.chain), &config.data_dir));
+        for peer in &config.peers {
+            // Offered rather than dialled here: the connector owns dialling, and it applies
+            // the netgroup rule to these exactly as to anything else.
+            let offered = shared.candidates.offer(*peer);
+            assert!(offered, "a peer named twice is a mistake worth seeing");
+        }
         let mut supervisor = Supervisor::with_capacity(THREAD_COUNT);
 
         let listening = Arc::clone(&shared);
@@ -258,6 +328,11 @@ impl Runtime {
 
     /// Where the node is accepting connections, which is the requested address unless the
     /// operator asked for port zero.
+    #[allow(
+        dead_code,
+        reason = "the node announces this as it binds; the accessor is what a test connects \
+                  to, and what `status` will report once the control socket answers"
+    )]
     pub fn listen_address(&self) -> SocketAddr {
         self.listen
     }
@@ -294,6 +369,20 @@ impl Runtime {
             self.shared.shutdown.is_begun(),
             "a shutdown is announced before it is performed",
         );
+        // Before the sockets close, because an anchor is the address of a connection that
+        // is still live: two block-relay-only peers, dialled first at the next start, so
+        // that an eclipse has to survive a restart to hold.
+        let anchors = self.shared.slots.anchor_addresses();
+        assert!(anchors.len() <= MAX_ANCHORS);
+        // Nothing to remember is not the same as remembering nothing: a node that started,
+        // failed to reach its anchors and stopped must keep the ones it had rather than
+        // erase the only addresses it has evidence about.
+        if !anchors.is_empty() {
+            match self.shared.candidates.save_anchors(&anchors) {
+                Ok(()) => println!("bitmigo: remembered {} anchors", anchors.len()),
+                Err(error) => eprintln!("bitmigo: anchors: {error}"),
+            }
+        }
         let live = self.shared.slots.shutdown_all();
         if live > 0 {
             println!("bitmigo: closed {live} peer connections");

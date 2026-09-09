@@ -50,7 +50,7 @@ mod tests {
 
     #[test]
     fn the_control_thread_stops_when_the_node_does() {
-        let shared = Arc::new(Shared::new(Chain::Regtest));
+        let shared = Arc::new(Shared::testing(Chain::Regtest));
         let running = Arc::clone(&shared);
         let control = Builder::new()
             .name("control".to_owned())

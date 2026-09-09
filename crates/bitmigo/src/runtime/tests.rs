@@ -4,6 +4,7 @@
 //! of the slot table filled past the end, and the backpressure taken in the order it is
 //! supposed to arrive in.
 
+use bitcoin::p2p::message::NetworkMessage;
 use std::io::Read;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -77,6 +78,8 @@ fn a_node_starts_its_whole_table_refuses_a_full_table_and_stops() {
     let config = Config {
         listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         chain: Chain::Regtest,
+        data_dir: std::env::temp_dir().join("bitmigo-tests"),
+        peers: Vec::new(),
         join_deadline: Duration::from_secs(5),
     };
     let pipe = SignalPipe::detached().expect("a test pipe");
@@ -123,7 +126,7 @@ fn a_node_starts_its_whole_table_refuses_a_full_table_and_stops() {
 
 #[test]
 fn the_pipeline_degrades_backwards_from_validation_to_tcp() {
-    let shared = Arc::new(Shared::new(Chain::Regtest));
+    let shared = Arc::new(Shared::testing(Chain::Regtest));
 
     // 1. Validation stalls — a long connect, or a flush of the coin cache. Nothing pulls,
     //    so the connect queue fills to its bound.
@@ -147,10 +150,11 @@ fn the_pipeline_degrades_backwards_from_validation_to_tcp() {
     let mut queued: usize = 0;
     while shared
         .to_chain
-        .try_send(PeerMessage {
-            peer: SlotIndex::new(0),
-            bytes: vec![0u8; MAX_MESSAGE_BYTES],
-        })
+        .try_send(PeerMessage::new(
+            SlotIndex::new(0),
+            NetworkMessage::Ping(0),
+            MAX_MESSAGE_BYTES,
+        ))
         .is_ok()
     {
         queued = queued.saturating_add(1);
@@ -169,10 +173,11 @@ fn the_pipeline_degrades_backwards_from_validation_to_tcp() {
     let reader = Builder::new()
         .name(format!("{READER_THREAD_PREFIX}00"))
         .spawn(move || {
-            sending.to_chain.send(PeerMessage {
-                peer: SlotIndex::new(0),
-                bytes: vec![0u8; MAX_MESSAGE_BYTES],
-            })
+            sending.to_chain.send(PeerMessage::new(
+                SlotIndex::new(0),
+                NetworkMessage::Ping(0),
+                MAX_MESSAGE_BYTES,
+            ))
         })
         .expect("a test thread");
 

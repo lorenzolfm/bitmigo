@@ -23,7 +23,8 @@ use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use bitcoin::BlockHash;
+use bitcoin::p2p::message::NetworkMessage;
+use bitcoin::{Block, BlockHash};
 use bitmigo_consensus::header::Context;
 use bitmigo_consensus::params::Height;
 
@@ -50,15 +51,67 @@ const SEND_TICK: Duration = Duration::from_millis(250);
 /// What a peer reader hands the chain thread.
 ///
 /// The receipt-time work has already happened on the reader's own thread, against the
-/// context that came with the request, so what crosses here is a message the chain thread
-/// only has to record. The payload is bytes today; the peer protocol replaces it with the
-/// deserialized message without changing the queue.
+/// context that came with the request: framing, the item counts, `check_header` or
+/// `check_block` and `accept_block`. What crosses here is a message the chain thread only
+/// has to record.
 #[derive(Debug, PartialEq, Eq)]
 pub struct PeerMessage {
     /// Which peer slot this came from.
     pub peer: SlotIndex,
-    /// The message body, at most one protocol message.
-    pub bytes: Vec<u8>,
+    /// The message, decoded and already checked as far as one thread can check it.
+    pub message: NetworkMessage,
+    /// What it holds, measured once at construction.
+    footprint: usize,
+}
+
+impl PeerMessage {
+    /// One message from one peer, weighed as it is built.
+    ///
+    /// The weight is measured rather than assumed, and it is measured here rather than in
+    /// [`Weighed::byte_len`] because the queue asks for it twice — once to make room and
+    /// once to give the room back — and an answer that could differ between the two would
+    /// let the accounting drift until the bound stopped binding.
+    ///
+    /// `wire_len` is what the message took on the wire. For everything but a block that is
+    /// also what it takes in memory; a decoded block owns rather more than its serialized
+    /// size, and since a block is the only message that reaches four megabytes, it is the
+    /// only one worth walking.
+    pub fn new(peer: SlotIndex, message: NetworkMessage, wire_len: usize) -> PeerMessage {
+        let footprint = match &message {
+            NetworkMessage::Block(block) => block_footprint(block),
+            _ => wire_len,
+        };
+        PeerMessage {
+            peer,
+            message,
+            footprint,
+        }
+    }
+}
+
+/// What a decoded block holds, walking it once.
+///
+/// Bounded by the block, which `check_block` has already held to Bitcoin's own size limit
+/// before this is called, and cheap beside the merkle root the same thread has just
+/// computed. Without it the inbound queue would be bounded in wire bytes while holding
+/// several times that in memory, and a bound that is not the quantity it names is not one.
+fn block_footprint(block: &Block) -> usize {
+    let mut bytes = size_of::<Block>();
+    for transaction in &block.txdata {
+        bytes = bytes.saturating_add(size_of::<bitcoin::Transaction>());
+        for input in &transaction.input {
+            bytes = bytes
+                .saturating_add(size_of::<bitcoin::TxIn>())
+                .saturating_add(input.script_sig.len())
+                .saturating_add(input.witness.size());
+        }
+        for output in &transaction.output {
+            bytes = bytes
+                .saturating_add(size_of::<bitcoin::TxOut>())
+                .saturating_add(output.script_pubkey.len());
+        }
+    }
+    bytes
 }
 
 /// How much memory an item on a bounded queue holds.
@@ -72,7 +125,7 @@ pub trait Weighed {
 
 impl Weighed for PeerMessage {
     fn byte_len(&self) -> usize {
-        size_of::<PeerMessage>().saturating_add(self.bytes.len())
+        size_of::<PeerMessage>().saturating_add(self.footprint)
     }
 }
 

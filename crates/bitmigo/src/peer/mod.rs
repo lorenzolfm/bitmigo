@@ -30,11 +30,26 @@
 
 use std::time::Duration;
 
+mod disconnect;
+mod discovery;
+mod handshake;
 mod net;
+mod network;
+mod outbox;
+mod requests;
+mod session;
 mod slots;
+mod wire;
 
+pub use disconnect::Disconnect;
+pub use discovery::{Candidates, MAX_ANCHORS};
+pub use handshake::{Handshake, nonce};
 pub use net::{connector, listener, reader, writer};
+pub use network::Network;
+pub use outbox::Outbox;
+pub use requests::Requests;
 pub use slots::{Connection, PeerSlots, SlotIndex, SlotKind};
+pub use wire::{Frame, Framer, MAX_MESSAGE_LEN, encode};
 
 /// Connection slots, and so half the node's threads.
 pub const PEER_SLOTS: usize = 32;
@@ -47,6 +62,15 @@ pub const OUTBOUND_SLOTS: usize = 10;
 /// Inbound connections. Service to the network, and the only slots an anonymous peer can
 /// take: filling them all denies other people's nodes, not this one.
 pub const INBOUND_SLOTS: usize = 22;
+
+/// How many of the outbound connections ask for blocks and nothing else. Core's
+/// `MAX_BLOCK_RELAY_ONLY_CONNECTIONS`, and the same two are its `MAX_BLOCK_RELAY_ONLY_ANCHORS`:
+/// a connection that never takes part in address relay is one an attacker who has poisoned
+/// this node's address table has not learned about, and remembering it across a restart is
+/// what stops an eclipse from surviving one.
+pub const BLOCK_RELAY_SLOTS: usize = 2;
+
+const _: () = assert!(BLOCK_RELAY_SLOTS < OUTBOUND_SLOTS);
 
 const _: () = assert!(OUTBOUND_SLOTS + INBOUND_SLOTS == PEER_SLOTS);
 
@@ -75,3 +99,48 @@ pub const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 /// allows only while a message that large is legitimately expected; the allocation is never
 /// made from a length an anonymous peer declared.
 pub const READ_BUFFER_INITIAL_BYTES: usize = 64 * 1024;
+
+/// What a peer may make this node hold when it owes us nothing.
+///
+/// A uniform four-megabyte cap would let thirty-two peers force a hundred and twenty-eight
+/// megabytes of attacker-chosen buffer. The only message that legitimately reaches four
+/// megabytes is a `block`, and a headers-first node never has to accept a block it did not
+/// ask for — so the full cap applies only to a peer with an outstanding `getdata`, and an
+/// inbound peer, which is never asked for anything until it has proved useful, can never
+/// push this node past half a megabyte. With `fRelay = 0` there are no transaction
+/// inventories, so nothing else comes close (BM-D5 decision 4).
+pub const READ_CAP_IDLE: usize = 512 * 1024;
+
+/// First header byte to last payload byte. A peer that spreads one message over longer than
+/// this is the dribbler no per-read timeout can catch: it defeats [`READ_TICK`] by sending
+/// one byte a second forever, and costs a thread for as long as it does.
+pub const MESSAGE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Core's `PING_INTERVAL`: how long a quiet connection waits before this node pings it.
+pub const PING_INTERVAL: Duration = Duration::from_secs(120);
+
+/// Core's `TIMEOUT_INTERVAL`: silence, or an unanswered ping, for this long is a peer that
+/// has gone away without saying so.
+pub const PEER_TIMEOUT: Duration = Duration::from_mins(20);
+
+/// Core's `DEFAULT_PEER_CONNECT_TIMEOUT`: a connection that has not finished the handshake
+/// in this long is dropped. It is the bound on how long an anonymous peer can hold a slot
+/// without having said anything at all.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Core's `DEFAULT_MAXSENDBUFFER`, per peer. Core pauses the sender when the buffer fills;
+/// this node disconnects instead, because everything it queues is a reply nobody is waiting
+/// on and a peer that will not read is not worth a megabyte.
+pub const OUTBOX_MAX_BYTES: usize = 1024 * 1024;
+
+/// The protocol version this node advertises: Core's `PROTOCOL_VERSION` at v31.1, not the
+/// `bitcoin` crate's 70001, which is below every feature gate from `SENDHEADERS_VERSION` up
+/// (R4 §6.3).
+pub const PROTOCOL_VERSION: u32 = 70_016;
+
+/// Core's `MIN_PEER_PROTO_VERSION`: "disconnect from peers older than this proto version".
+pub const MIN_PEER_PROTO_VERSION: u32 = 31_800;
+
+/// What this node tells a peer it is. Bitcoin's convention, and the version this crate
+/// carries: a peer that has to work around us should be able to tell which release it is.
+pub const USER_AGENT: &str = concat!("/bitmigo:", env!("CARGO_PKG_VERSION"), "/");

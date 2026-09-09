@@ -92,6 +92,7 @@ mod tests {
     use crate::runtime::Shared;
     use crate::runtime::queue::PeerMessage;
     use crate::runtime::signal::Cause;
+    use bitcoin::p2p::message::NetworkMessage;
     use bitmigo_consensus::params::Chain;
     use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
@@ -109,7 +110,7 @@ mod tests {
 
     #[test]
     fn the_chain_thread_drains_what_the_readers_send_it() {
-        let shared = Arc::new(Shared::new(Chain::Regtest));
+        let shared = Arc::new(Shared::testing(Chain::Regtest));
         let chain = spawn_chain(&shared);
 
         let sending = Arc::clone(&shared);
@@ -119,10 +120,11 @@ mod tests {
                 for _ in 0..64 {
                     sending
                         .to_chain
-                        .send(PeerMessage {
-                            peer: SlotIndex::new(0),
-                            bytes: vec![7u8; 1024],
-                        })
+                        .send(PeerMessage::new(
+                            SlotIndex::new(0),
+                            NetworkMessage::Ping(7),
+                            1024,
+                        ))
                         .expect("the queue is open");
                 }
             })
@@ -143,7 +145,7 @@ mod tests {
 
     #[test]
     fn the_operator_sees_the_peer_count_through_the_published_snapshot() {
-        let shared = Arc::new(Shared::new(Chain::Regtest));
+        let shared = Arc::new(Shared::testing(Chain::Regtest));
         let listener = TcpListener::bind("127.0.0.1:0").expect("a test socket");
         let address = listener.local_addr().expect("a bound address");
         let _client = TcpStream::connect(address).expect("a test connection");

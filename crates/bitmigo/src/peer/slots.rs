@@ -8,7 +8,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use super::{INBOUND_SLOTS, OUTBOUND_SLOTS, PEER_SLOTS};
+use super::discovery::netgroup;
+use super::{
+    BLOCK_RELAY_SLOTS, Disconnect, INBOUND_SLOTS, OUTBOUND_SLOTS, OUTBOX_MAX_BYTES, Outbox,
+    PEER_SLOTS, Requests,
+};
 use crate::runtime::sync::{lock, wait};
 
 /// How long a thread waiting for a connection sleeps before looking at the closing flag
@@ -25,6 +29,21 @@ pub enum SlotKind {
     /// Dialled by this node.
     Outbound,
     /// Accepted from the network.
+    Inbound,
+}
+
+/// What a slot is for. The outbound half is split the way Core splits it, and the split is
+/// a security parameter: a block-relay-only connection asks for headers and blocks and
+/// gossips nothing, so an attacker who has learned this node's peers from address relay has
+/// still learned nothing about these two, and they are the two that are remembered as
+/// anchors across a restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotRole {
+    /// One of the eight outbound connections that also take part in address relay.
+    FullRelay,
+    /// One of the two outbound connections that ask only for blocks.
+    BlockRelayOnly,
+    /// A connection somebody else made.
     Inbound,
 }
 
@@ -60,6 +79,18 @@ impl SlotIndex {
             SlotKind::Inbound
         }
     }
+
+    /// What the slot is for. The last [`BLOCK_RELAY_SLOTS`] of the outbound half are the
+    /// block-relay-only ones, which are also the anchors.
+    pub fn role(self) -> SlotRole {
+        match self.kind() {
+            SlotKind::Inbound => SlotRole::Inbound,
+            SlotKind::Outbound if self.get() < OUTBOUND_SLOTS.saturating_sub(BLOCK_RELAY_SLOTS) => {
+                SlotRole::FullRelay
+            }
+            SlotKind::Outbound => SlotRole::BlockRelayOnly,
+        }
+    }
 }
 
 impl std::fmt::Display for SlotIndex {
@@ -81,6 +112,66 @@ pub struct Connection {
     pub address: SocketAddr,
     /// When the connection was accepted or dialled.
     pub since: Instant,
+    /// Which slot holds it, and so what it is for.
+    pub index: SlotIndex,
+    /// Framed messages waiting for this connection's writer thread. A megabyte, and the
+    /// connection ends rather than the queue growing.
+    pub outbox: Arc<Outbox>,
+    /// The blocks this node has asked this peer for and not been given. The reader reads
+    /// its own message-size cap off this, and refuses a block that answers nothing in it.
+    pub requests: Arc<Requests>,
+    /// Whether the handshake is through. The reader owns the exchange; this is how every
+    /// other thread finds out, without asking the reader anything.
+    ready: Arc<AtomicBool>,
+    /// Why the connection ended, set by whichever thread decided. First writer wins: a
+    /// write that failed is why the read that follows it returns nothing.
+    ended: Arc<Mutex<Option<Disconnect>>>,
+}
+
+impl Connection {
+    /// Whether the `version`/`verack` exchange has completed. Until it has, this node
+    /// neither asks the peer for anything nor answers it anything.
+    #[allow(
+        dead_code,
+        reason = "the reader sets it; the download scheduler and the block server are the \
+                  threads that will read it, and they are BM-23 and BM-24"
+    )]
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::SeqCst)
+    }
+
+    /// Say the exchange is through. The reader thread's to call, once.
+    pub fn mark_ready(&self) {
+        self.ready.store(true, Ordering::SeqCst);
+    }
+
+    /// End the connection from any thread, saying why.
+    ///
+    /// `shutdown(Both)` is the mechanism: it ends the reader's blocking `read` at once
+    /// rather than after the read timeout, and closing the outbox ends the writer's wait.
+    /// The slot itself is released by the reader, which is the thread that owns noticing
+    /// that a connection is over — and which reports the reason recorded here rather than
+    /// the end-of-file it sees, so that a failed write is not logged as a peer hanging up.
+    pub fn disconnect(&self, reason: Disconnect) {
+        let mut ended = lock(&self.ended);
+        if ended.is_none() {
+            *ended = Some(reason);
+        }
+        drop(ended);
+        // A socket the peer has already closed answers `ENOTCONN`; nothing to do about it.
+        let _shut = self.stream.shutdown(Shutdown::Both);
+        self.outbox.close();
+    }
+
+    /// Why the connection ended, if a thread has already decided.
+    pub fn ended(&self) -> Option<Disconnect> {
+        *lock(&self.ended)
+    }
+
+    /// The address's network group, for the connector's diversity rule.
+    pub fn netgroup(&self) -> [u8; 4] {
+        netgroup(self.address)
+    }
 }
 
 /// One preallocated slot. The struct exists from startup; only the connection in it comes
@@ -166,17 +257,24 @@ impl PeerSlots {
         if self.closing.load(Ordering::SeqCst) {
             return None;
         }
-        let connection = Connection {
-            stream: Arc::new(stream),
-            address,
-            since: Instant::now(),
-        };
+        let stream = Arc::new(stream);
         for slot in self.slots.iter().filter(|slot| slot.kind() == kind) {
             let mut state = lock(&slot.state);
             if state.is_some() {
                 continue;
             }
-            *state = Some(connection);
+            // Built inside the loop because a connection knows which slot it is in: the
+            // reader reads its role off the index, and so do the anchors.
+            *state = Some(Connection {
+                stream: Arc::clone(&stream),
+                address,
+                since: Instant::now(),
+                index: slot.index(),
+                outbox: Arc::new(Outbox::with_bound(OUTBOX_MAX_BYTES)),
+                requests: Arc::new(Requests::new()),
+                ready: Arc::new(AtomicBool::new(false)),
+                ended: Arc::new(Mutex::new(None)),
+            });
             drop(state);
             self.counter(kind).fetch_add(1, Ordering::SeqCst);
             slot.changed.notify_all();
@@ -200,15 +298,21 @@ impl PeerSlots {
     }
 
     /// Block until this slot has a connection, or until the table is closing.
+    ///
+    /// A connection already in the slot is handed over even while the table is closing, and
+    /// the order of these two checks is that decision: a socket that was claimed between
+    /// the shutdown being announced and this thread waking is still a connection somebody
+    /// made, and it should be accounted for and reported rather than dropped silently. The
+    /// thread that takes it sees the shutdown on its first pass and ends it at once.
     pub fn wait_for_connection(&self, index: SlotIndex) -> Option<Connection> {
         let slot = self.slot(index)?;
         let mut state = lock(&slot.state);
         loop {
-            if self.closing.load(Ordering::SeqCst) {
-                return None;
-            }
             if let Some(connection) = state.clone() {
                 return Some(connection);
+            }
+            if self.closing.load(Ordering::SeqCst) {
+                return None;
             }
             state = wait(&slot.changed, state, SLOT_TICK);
         }
@@ -238,15 +342,64 @@ impl PeerSlots {
         for slot in &self.slots {
             let state = lock(&slot.state);
             if let Some(connection) = state.as_ref() {
-                // A socket the peer has already closed answers `ENOTCONN`; there is nothing
-                // to do about that and nothing to report.
-                let _shut = connection.stream.shutdown(Shutdown::Both);
+                connection.disconnect(Disconnect::NodeStopping);
                 live = live.saturating_add(1);
             }
             drop(state);
             slot.changed.notify_all();
         }
         live
+    }
+
+    /// The connection in a slot, for the threads that are neither its reader nor its
+    /// writer: the chain thread queueing a reply, and the shutdown remembering anchors.
+    #[allow(
+        dead_code,
+        reason = "the chain thread reaches a peer's outbox through this; queueing a reply \
+                  is the block server's, BM-24"
+    )]
+    pub fn connection(&self, index: SlotIndex) -> Option<Connection> {
+        let slot = self.slot(index)?;
+        let state = lock(&slot.state);
+        state.clone()
+    }
+
+    /// The network groups the live outbound connections are in.
+    ///
+    /// The connector's diversity rule reads this before it dials: an attacker who owns one
+    /// /16 must not be able to take more than one of the ten connections this node's own
+    /// safety depends on. A bounded scan of ten slots, once per dial.
+    pub fn outbound_netgroups(&self) -> Vec<[u8; 4]> {
+        let mut groups = Vec::with_capacity(OUTBOUND_SLOTS);
+        for slot in self
+            .slots
+            .iter()
+            .filter(|slot| slot.kind() == SlotKind::Outbound)
+        {
+            let state = lock(&slot.state);
+            if let Some(connection) = state.as_ref() {
+                groups.push(connection.netgroup());
+            }
+        }
+        groups
+    }
+
+    /// The addresses of the live block-relay-only connections, which are what a clean stop
+    /// writes down as anchors.
+    pub fn anchor_addresses(&self) -> Vec<SocketAddr> {
+        let mut addresses = Vec::with_capacity(BLOCK_RELAY_SLOTS);
+        for slot in self
+            .slots
+            .iter()
+            .filter(|slot| slot.index().role() == SlotRole::BlockRelayOnly)
+        {
+            let state = lock(&slot.state);
+            if let Some(connection) = state.as_ref() {
+                addresses.push(connection.address);
+            }
+        }
+        assert!(addresses.len() <= BLOCK_RELAY_SLOTS);
+        addresses
     }
 
     /// Whether the table has been closed.
