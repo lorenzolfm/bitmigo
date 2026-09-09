@@ -46,10 +46,12 @@ pub use sighash::{TaprootSpend, TxPrecomputed};
 pub use sigops::{SigOpMode, p2sh_sigop_count, sigop_count, witness_sigop_count};
 pub use verify::{verify_input, verify_script};
 
-// The block rules build the BIP34 height prefix the way `CScript() << height` does; these
-// two are the pieces of that operator, shared rather than reimplemented.
+// The block rules assemble scripts of their own: the BIP34 height prefix the way
+// `CScript() << height` does, and signet's rewritten witness commitment. These are the
+// pieces they need, shared rather than reimplemented.
 pub(crate) use num::ScriptNum;
-pub(crate) use reader::push_encoding;
+pub(crate) use opcode::{OP_0, OP_RETURN};
+pub(crate) use reader::{Reader, push_encoding};
 
 /// The rules a script executes under: Core's `SigVersion` minus `TAPROOT`, because the
 /// taproot key path executes no script. A key-path signature is checked through

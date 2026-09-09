@@ -21,9 +21,11 @@
 //! written down. It holds only what validation reads. The node keeps its own table of what
 //! validation never reads: network magic, ports, DNS seeds, minimum chain work.
 //!
-//! Three chains are tabled: mainnet, signet and regtest. Signet's constructor and its block
-//! challenge arrive with the `signet` module; testnet3 and testnet4 are data to add if a
-//! rule ever needs them. There are no checkpoints, because Core has none.
+//! Three chains are tabled: mainnet, signet and regtest; testnet3 and testnet4 are data to
+//! add if a rule ever needs them. There are no checkpoints, because Core has none. Signet
+//! carries one thing the other two do not, a [`BlockChallenge`]: `check_block` must find a
+//! signature over the block under that script (BIP325), and `block::signet` is where the
+//! rule lives.
 
 mod height;
 mod regtest;
@@ -40,7 +42,7 @@ use bitcoin::block::Block;
 use bitcoin::constants::genesis_block;
 use bitcoin::hashes::Hash;
 use bitcoin::pow::Target;
-use bitcoin::{BlockHash, Network};
+use bitcoin::{BlockHash, Network, ScriptBuf};
 
 /// A block hash as `BlockHash::to_byte_array` lays it out: the reverse of the displayed hex.
 /// Tables hold this instead of `BlockHash` because the pinned crates offer no `const`
@@ -57,6 +59,18 @@ pub enum Chain {
     Signet,
     /// The local test chain the differential harness runs against `bitcoind -regtest`.
     Regtest,
+}
+
+/// Whether a block must carry a signature, and over which script. Core spells this as the
+/// pair `signet_blocks` / `signet_challenge` on `Consensus::Params`; one enum cannot say
+/// "signet, no challenge" or "mainnet, with a challenge" (§2.8).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum BlockChallenge {
+    /// Proof of work is the only thing a block must prove: mainnet and regtest.
+    None,
+    /// BIP325: the block must also carry a solution to this script, checked by
+    /// [`crate::block::check_signet_solution`].
+    Signet(ScriptBuf),
 }
 
 /// BIP34's buried height and, where the chain has one, the block at that height. Core skips
@@ -101,6 +115,8 @@ const BIP30_REPEAT_EXCEPTIONS_MAX: usize = 2;
 
 const MAINNET_GENESIS_HASH: HashBytes =
     hash_bytes("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f");
+const SIGNET_GENESIS_HASH: HashBytes =
+    hash_bytes("00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6");
 const REGTEST_GENESIS_HASH: HashBytes =
     hash_bytes("0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206");
 /// Block 227931, the first block BIP34 covers on mainnet (§5.2).
@@ -110,6 +126,8 @@ const MAINNET_BIP34_HASH: HashBytes =
 /// `powLimit`, big-endian, as `kernel/chainparams.cpp` writes it (§1.1).
 const MAINNET_POW_LIMIT: [u8; 32] =
     hex_bytes("00000000ffff0000000000000000000000000000000000000000000000000000");
+const SIGNET_POW_LIMIT: [u8; 32] =
+    hex_bytes("00000377ae000000000000000000000000000000000000000000000000000000");
 const REGTEST_POW_LIMIT: [u8; 32] =
     hex_bytes("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
 
@@ -142,9 +160,9 @@ static MAINNET_BIP30_REPEAT_EXCEPTIONS: [Bip30RepeatException; 2] = [
     },
 ];
 
-/// Everything validation reads about a chain. Private fields; built by [`Self::mainnet`] and
-/// [`Self::regtest`] (and `signet`, once the `signet` module lands), which assert every
-/// invariant once so the accessors never have to.
+/// Everything validation reads about a chain. Private fields; built by [`Self::mainnet`],
+/// [`Self::signet`] and [`Self::regtest`], which assert every invariant once so the
+/// accessors never have to.
 #[derive(Clone, Debug)]
 pub struct ChainParams {
     chain: Chain,
@@ -165,6 +183,8 @@ pub struct ChainParams {
     buried: BuriedHeights,
     script_flag_exceptions: &'static [ScriptFlagException],
     bip30_repeat_exceptions: &'static [Bip30RepeatException],
+    /// `signet_blocks` and `signet_challenge`, as one value.
+    block_challenge: BlockChallenge,
 }
 
 impl ChainParams {
@@ -193,8 +213,51 @@ impl ChainParams {
             },
             script_flag_exceptions: &MAINNET_SCRIPT_FLAG_EXCEPTIONS,
             bip30_repeat_exceptions: &MAINNET_BIP30_REPEAT_EXCEPTIONS,
+            block_challenge: BlockChallenge::None,
         };
         params.assert_invariants(MAINNET_GENESIS_HASH);
+        params
+    }
+
+    /// Signet, as `SigNetParams` in Core v31.1, with `challenge` as its block challenge:
+    /// [`crate::block::signet::default_challenge`] for the signet BIP325 defines, or the
+    /// script behind bitcoind's `-signetchallenge` for a custom one. Everything else is
+    /// mainnet's rules with every buried deployment at height 1 and a `powLimit` of
+    /// `0x1e0377ae` (§5.2, §5.5).
+    ///
+    /// The genesis block is fixed by BIP325 whatever the challenge is: the challenge changes
+    /// the network's message-start bytes, which validation never reads, so a custom-challenge
+    /// signet and the default one share a genesis hash. `nMinimumChainWork` and
+    /// `defaultAssumeValid`, which Core clears for a custom challenge, are the node's and are
+    /// not here at all.
+    #[must_use]
+    pub fn signet(challenge: ScriptBuf) -> ChainParams {
+        let first = Height::new(1);
+        let params = ChainParams {
+            chain: Chain::Signet,
+            genesis: genesis_block(Network::Signet),
+            pow_limit: Target::from_be_bytes(SIGNET_POW_LIMIT),
+            pow_target_timespan: 14 * 24 * 60 * 60,
+            pow_target_spacing: 10 * 60,
+            no_retargeting: false,
+            allow_min_difficulty: false,
+            enforce_bip94: false,
+            halving_interval: 210_000,
+            buried: BuriedHeights {
+                bip34: Bip34 {
+                    height: first,
+                    hash: None,
+                },
+                bip66: first,
+                bip65: first,
+                csv: first,
+                segwit: first,
+            },
+            script_flag_exceptions: &[],
+            bip30_repeat_exceptions: &[],
+            block_challenge: BlockChallenge::Signet(challenge),
+        };
+        params.assert_invariants(SIGNET_GENESIS_HASH);
         params
     }
 
@@ -225,6 +288,7 @@ impl ChainParams {
             },
             script_flag_exceptions: &[],
             bip30_repeat_exceptions: &[],
+            block_challenge: BlockChallenge::None,
         };
         params.assert_invariants(REGTEST_GENESIS_HASH);
         params
@@ -256,12 +320,30 @@ impl ChainParams {
         if self.chain != Chain::Mainnet {
             assert!(self.buried.bip34.hash.is_none());
         }
+
+        // `signet_blocks` is true on exactly one chain, and an empty challenge is
+        // unsatisfiable: `VerifyScript` on an empty scriptPubKey leaves an empty stack.
+        match &self.block_challenge {
+            BlockChallenge::None => assert_ne!(self.chain, Chain::Signet),
+            BlockChallenge::Signet(challenge) => {
+                assert_eq!(self.chain, Chain::Signet);
+                assert!(!challenge.is_empty());
+            }
+        }
     }
 
     /// Which chain these parameters describe.
     #[must_use]
     pub fn chain(&self) -> Chain {
         self.chain
+    }
+
+    /// Whether a block on this chain must carry a signature, and over which script.
+    /// [`crate::block::check_block`] matches on it; only signet is not
+    /// [`BlockChallenge::None`].
+    #[must_use]
+    pub fn block_challenge(&self) -> &BlockChallenge {
+        &self.block_challenge
     }
 
     /// The genesis block. Its coinbase output never enters the UTXO set (§1.5).
@@ -336,19 +418,20 @@ impl ChainParams {
     }
 }
 
-/// Parses 64 lower-case hex digits into bytes in the order written, at compile time. A typo
-/// in a constant is a build error, not a chain split.
+/// Parses `2 * N` lower-case hex digits into `N` bytes in the order written, at compile
+/// time. A typo in a constant is a build error, not a chain split. The `signet` module's
+/// default challenge is the one caller that wants a length other than 32.
 #[allow(
     clippy::indexing_slicing,
     reason = "runs at compile time only; the length is asserted and an out-of-range index \
               fails the build"
 )]
-const fn hex_bytes(hex: &str) -> [u8; 32] {
+pub(crate) const fn hex_bytes<const N: usize>(hex: &str) -> [u8; N] {
     let digits = hex.as_bytes();
-    assert!(digits.len() == 64);
-    let mut bytes = [0u8; 32];
+    assert!(digits.len() == 2 * N);
+    let mut bytes = [0u8; N];
     let mut index = 0;
-    while index < 32 {
+    while index < N {
         let high = hex_digit(digits[2 * index]);
         let low = hex_digit(digits[2 * index + 1]);
         bytes[index] = (high << 4) | low;
@@ -364,7 +447,7 @@ const fn hex_bytes(hex: &str) -> [u8; 32] {
     reason = "runs at compile time only; both arrays are 32 long and the index is below 32"
 )]
 const fn hash_bytes(hex: &str) -> HashBytes {
-    let displayed = hex_bytes(hex);
+    let displayed: HashBytes = hex_bytes(hex);
     let mut bytes = [0u8; 32];
     let mut index = 0;
     while index < 32 {

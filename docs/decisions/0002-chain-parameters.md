@@ -12,8 +12,8 @@ chain. The table has this shape and no other:
   height per chain. P2SH, WITNESS and TAPROOT have none: they apply from genesis, minus a
   per-block **exception list keyed by block hash** (mainnet blocks 170060 and 692261). There
   is no BIP9 versionbits state machine and no `-vbparams`.
-- **`ChainParams` has private fields and named constructors** (`mainnet()`, `regtest(overrides)`,
-  and `signet(challenge)` when the signet module lands), and holds only what validation reads:
+- **`ChainParams` has private fields and named constructors** (`mainnet()`, `signet(challenge)`
+  and `regtest(overrides)`), and holds only what validation reads:
   genesis, `powLimit`, retarget parameters, halving interval, buried heights, the BIP34 block
   hash, the exception lists. Network magic, ports, seeds and minimum chain work are the node's.
 - **`Height` and `BlockTime` are newtypes** with no `From<u32>` and only the arithmetic the
@@ -49,7 +49,10 @@ chain. The table has this shape and no other:
   repeat blocks and, on mainnet, from the block after the BIP34 block until height 1,983,702
   (`BIP34_IMPLIES_BIP30_LIMIT`). The node reports the hash of the ancestor at the BIP34
   height; the crate compares it, so a node cannot assert a match.
-- The script flag type in `params` is a stand-in with Core's bit positions. The script
-  interpreter owns the real one and replaces it when it lands.
+- The script flag type is the interpreter's `script::ScriptFlags`, re-exported by `params`
+  because `Rules` produces it.
+- Signet is the one chain whose `ChainParams` carries a `BlockChallenge`. The rule it implies
+  is a block rule, so it lives in `block::signet`; `check_block` matches on the challenge and
+  mainnet and regtest take the `None` arm.
 - Testnet3 and testnet4 are data, not design: adding one is a constructor and a table row,
   with the testnet3 exception block 394 joining the exception list.

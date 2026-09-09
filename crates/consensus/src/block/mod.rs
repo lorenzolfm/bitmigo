@@ -10,12 +10,13 @@
 //! The coins path, [`populate`], [`confirm`] and [`connect`] over the same `Context`, runs
 //! in chain order and produces the [`BlockDelta`]; it lives in `coins`.
 //!
-//! The signet solution check belongs in `check_block` (§2.8); the `signet` module adds it
-//! behind a `BlockChallenge` on [`ChainParams`], which is why `check_block` already takes the
-//! parameters.
+//! The signet solution check belongs in `check_block` (§2.8), which is why it takes the
+//! chain parameters: on signet those carry a [`BlockChallenge`] and the block must also
+//! satisfy it. All of BIP325 is in [`signet`].
 
 mod coins;
 mod merkle;
+pub mod signet;
 
 use core::fmt;
 
@@ -24,7 +25,7 @@ use bitcoin::hashes::{Hash, sha256d};
 use bitcoin::{Block, Transaction, VarInt};
 
 use crate::header::{Context, HeaderError, check_header};
-use crate::params::{BlockTime, ChainParams, Height};
+use crate::params::{BlockChallenge, BlockTime, ChainParams, Height};
 use crate::script::{ScriptNum, push_encoding};
 use crate::tx::{
     MAX_BLOCK_SIGOPS_COST, MAX_BLOCK_WEIGHT, TxError, WITNESS_SCALE_FACTOR, check_tx, is_final,
@@ -36,6 +37,7 @@ pub use coins::{
     MAX_BLOCK_OUTPUTS, Prefetch, confirm, connect, populate,
 };
 pub use merkle::{MerkleRoot, merkle_root};
+pub use signet::{SignetError, SignetTxs, check_signet_solution, signet_txs};
 
 /// Core's `MINIMUM_WITNESS_COMMITMENT`: a coinbase output is the witness commitment when its
 /// script is at least this long and opens with [`WITNESS_COMMITMENT_HEADER`] (§2.6).
@@ -111,6 +113,8 @@ pub enum BlockError {
         /// The weight seen.
         weight: u64,
     },
+    /// `bad-signet-blksig`: the block carries no valid signature over itself (BIP325).
+    Signet(SignetError),
 }
 
 impl fmt::Display for BlockError {
@@ -118,6 +122,7 @@ impl fmt::Display for BlockError {
         match self {
             Self::Header(error) => error.fmt(f),
             Self::Transaction { error, .. } => error.fmt(f),
+            Self::Signet(error) => error.fmt(f),
             Self::BadMerkleRoot { .. } => f.write_str("bad-txnmrklroot"),
             Self::DuplicateTransactions => f.write_str("bad-txns-duplicate"),
             Self::BadLength { .. } => f.write_str("bad-blk-length"),
@@ -136,14 +141,23 @@ impl fmt::Display for BlockError {
 
 impl std::error::Error for BlockError {}
 
-/// Core's `CheckBlock`, in its order: the header's proof of work, the merkle root and its
-/// mutation check, the size limits, one coinbase first and no other, `CheckTransaction` on
-/// every transaction, and the legacy signature operation budget (§2.8). Context-free.
+/// Core's `CheckBlock`, in its order: the header's proof of work, the signet solution where
+/// the chain has a challenge, the merkle root and its mutation check, the size limits, one
+/// coinbase first and no other, `CheckTransaction` on every transaction, and the legacy
+/// signature operation budget (§2.8). Context-free.
 ///
 /// The witness data is not read here: it is committed to by the coinbase, and only
 /// [`accept_block`] can tell whether a commitment is expected.
 pub fn check_block(block: &Block, params: &ChainParams) -> Result<(), BlockError> {
     check_header(&block.header, params).map_err(BlockError::Header)?;
+
+    // Signet only, and before the merkle root as Core has it. Genesis is exempt: its
+    // solution is whatever BIP325 fixed it as, and only these parameters know its hash.
+    if let BlockChallenge::Signet(challenge) = params.block_challenge()
+        && block.block_hash() != params.genesis_hash()
+    {
+        check_signet_solution(block, challenge).map_err(BlockError::Signet)?;
+    }
 
     // Every check that a peer could fail by sending the wrong transactions for an honest
     // header comes before any that would mark the header invalid.
