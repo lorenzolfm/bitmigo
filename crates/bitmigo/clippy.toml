@@ -1,0 +1,5 @@
+# Clippy reads the nearest clippy.toml only, so the workspace settings are repeated here.
+too-many-lines-threshold = 70
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

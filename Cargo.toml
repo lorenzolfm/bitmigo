@@ -34,8 +34,19 @@ secp256k1 = { version = "=0.29.1", default-features = false, features = ["std"] 
 # docs/decisions/0003-differential-oracle.md.
 bitcoinconsensus = { version = "=0.106.0", default-features = false, features = ["std"] }
 
+# The fourth crate, and the node binary's alone: `crates/consensus` never links it and its
+# purity tripwire is untouched. `std` gives the node every other syscall it needs — socket
+# timeouts, `shutdown`, `pread`, `fsync`, Unix sockets, explicit stack sizes — but no signal
+# handling, and a node that cannot answer `SIGINT` cleanly turns every Ctrl-C into a
+# crash-recovery restart. rust-lang first-party, zero transitive dependencies. See
+# docs/decisions/0004-libc.md.
+libc = { version = "=0.2.189", default-features = false, features = ["std"] }
+
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# `deny`, not `forbid`, because `bitmigo::runtime::signal` needs `sigaction` and a `write`
+# from a signal handler, and lifts this with an `#[allow]` that names its reason. Every
+# other crate root re-states it as `#![forbid(unsafe_code)]`, which cannot be lifted at all.
+unsafe_code = "deny"
 missing_docs = "warn"
 
 # TigerStyle, mechanised where clippy can. The function-length threshold (70) lives in
@@ -63,3 +74,12 @@ unimplemented = { level = "warn", priority = 2 }
 missing_panics_doc = { level = "allow", priority = 3 }
 missing_errors_doc = { level = "allow", priority = 3 }
 module_name_repetitions = { level = "allow", priority = 3 }
+
+# Panics are prevented, not contained. A panic in framing code that is caught and logged is a
+# bug that will never be found; an abort is loud, the storage engine's crash consistency makes
+# it lose nothing but time, and the process supervisor restarts the node.
+# `overflow-checks` puts arithmetic on attacker-supplied lengths in scope of that rule too,
+# which is the reason it is on in release and not just in debug.
+[profile.release]
+panic = "abort"
+overflow-checks = true

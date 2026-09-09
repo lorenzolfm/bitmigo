@@ -19,6 +19,10 @@
 //! storage applies, all over the same `Context`, and `block::signet`, the one rule only one
 //! chain has.
 
+// This crate never writes `unsafe`: it hashes, parses and decides, and every one of those
+// is expressible safely. `forbid` rather than the workspace's `deny` so that no module can
+// lift it with an `#[allow]`.
+#![forbid(unsafe_code)]
 // The purity tripwire in `clippy.toml` is a hard error here, not a warning like the rest of
 // clippy: reaching for the disk or the network from consensus is a design bug, not style.
 #![deny(clippy::disallowed_types, clippy::disallowed_methods)]

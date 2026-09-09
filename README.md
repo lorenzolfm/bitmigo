@@ -8,7 +8,10 @@ crates for types, serialization, hashing and signature verification, and on noth
 The rules themselves are written here, in a style meant to be read: bounded, asserted,
 and small enough to fit on a screen.
 
-**Status:** pre-alpha. The workspace builds and does nothing yet.
+**Status:** pre-alpha. The consensus rules — headers, transactions, blocks, the script
+interpreter and the coins path — are written and tested against Bitcoin Core's vectors. The
+node starts, accepts connections and stops cleanly; it does not yet speak the peer protocol,
+so it syncs nothing.
 
 ## Building
 

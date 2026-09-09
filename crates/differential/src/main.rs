@@ -11,6 +11,9 @@
 //! `--iterations 1 --seed <case seed>` replays one. `assets` exits 1 on the first record
 //! bitmigo gets wrong, with the record's comment.
 
+// The oracle's `unsafe` lives inside `bitcoinconsensus`; this crate writes none of its own.
+#![forbid(unsafe_code)]
+
 use std::path::Path;
 use std::process::ExitCode;
 

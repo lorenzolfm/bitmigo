@@ -15,6 +15,9 @@
 //! the 128-combination flag rule. Neither is part of the node; nothing here is linked into
 //! it.
 
+// The oracle's `unsafe` lives inside `bitcoinconsensus`; this crate writes none of its own.
+#![forbid(unsafe_code)]
+
 pub mod assets;
 pub mod case;
 pub mod fuzz;

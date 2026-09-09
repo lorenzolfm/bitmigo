@@ -9,6 +9,13 @@ repository.workspace = true
 
 [dependencies]
 bitmigo-consensus.workspace = true
+bitcoin.workspace = true
+# Signals, and nothing else: see docs/decisions/0004-libc.md.
+libc.workspace = true
+
+[dev-dependencies]
+# The integration tests signal the node the way an operator does.
+libc.workspace = true
 
 [lints]
 workspace = true
