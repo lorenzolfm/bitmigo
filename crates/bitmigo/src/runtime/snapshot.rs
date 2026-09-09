@@ -15,6 +15,7 @@
 use std::sync::Mutex;
 
 use bitcoin::BlockHash;
+use bitcoin::pow::Work;
 use bitmigo_consensus::params::{Chain, Height};
 
 use crate::runtime::sync::lock;
@@ -54,6 +55,12 @@ pub struct StatusSnapshot {
     pub tip_height: Height,
     /// The most-work header accepted, which during a sync runs far ahead of the tip.
     pub header_height: Height,
+    /// That header's hash.
+    pub header_tip: Option<BlockHash>,
+    /// The work behind it, which is what the most-work choice compares.
+    pub header_work: Work,
+    /// How deep the last reorg was. Six or more is the number an operator is warned about.
+    pub last_reorg_depth: usize,
     /// Blocks requested and not yet received.
     pub blocks_in_flight: usize,
     /// Peers with a completed handshake.
@@ -75,6 +82,9 @@ impl StatusSnapshot {
             tip: None,
             tip_height: Height::GENESIS,
             header_height: Height::GENESIS,
+            header_tip: None,
+            header_work: Work::from_be_bytes([0u8; 32]),
+            last_reorg_depth: 0,
             blocks_in_flight: 0,
             peers: 0,
             initial_block_download: true,

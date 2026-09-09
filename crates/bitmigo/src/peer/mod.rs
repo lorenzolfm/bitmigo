@@ -49,7 +49,7 @@ pub use network::Network;
 pub use outbox::Outbox;
 pub use requests::Requests;
 pub use slots::{Connection, PeerSlots, SlotIndex, SlotKind};
-pub use wire::{Frame, Framer, MAX_MESSAGE_LEN, encode};
+pub use wire::{Frame, Framer, MAX_HEADERS_ITEMS, MAX_LOCATOR_ITEMS, MAX_MESSAGE_LEN, encode};
 
 /// Connection slots, and so half the node's threads.
 pub const PEER_SLOTS: usize = 32;
