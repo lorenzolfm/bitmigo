@@ -23,7 +23,7 @@ mod locator;
 mod reorg;
 mod tree;
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bitcoin::block::Header;
 use bitcoin::p2p::message::NetworkMessage;
@@ -33,6 +33,8 @@ use crate::download::{HeadersReceived, Schedule};
 use crate::peer::{Disconnect, MAX_HEADERS_ITEMS, SlotIndex};
 use crate::runtime::Shared;
 use crate::runtime::queue::{PeerMessage, Received};
+use crate::runtime::signal::Cause;
+use crate::store::ChainStore;
 
 // The module's own surface, named here so the modules that will drive it — the receipt
 // path, the chainstate, the download schedule and the block server — reach one place.
@@ -50,19 +52,34 @@ pub use reorg::{REORG_WARNING_DEPTH, Reorg};
 )]
 pub use tree::{
     AcceptError, Accepted, HeaderEntry, HeaderStatus, HeaderTree, Invalidity, MAX_TREE_HEADERS,
-    NodeId, UndoLocation,
+    NodeId, Stage, UndoLocation,
 };
 
 /// How long the thread waits for a message before looking at the shutdown flag and its
 /// schedule again. Both a message and a shutdown wake it directly; this bounds the wait.
 const CHAIN_TICK: Duration = Duration::from_millis(250);
 
+/// How many changed index entries are worth an `fsync` on their own.
+///
+/// Not one per block, which BM-D4 decision 6 rules out: a batch this size is one `fsync`
+/// per thousand headers during a sync, and near the tip the interval below is what fires.
+const COMMIT_BATCH: usize = 1024;
+
+/// How long a change may sit uncommitted. The coin store's own periodic flush is Core's
+/// randomised fifty to seventy minutes, and the index has to be ahead of it — a minute
+/// leaves that ordering an hour of room and costs one `fsync` a minute at worst.
+const COMMIT_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Run until the node stops.
-pub fn run(shared: &Shared) {
-    let mut tree = HeaderTree::new(&shared.params);
+///
+/// The tree arrives loaded: the block index is replayed on the startup thread, before any
+/// socket is bound, so a store this node cannot read is a message and an exit code rather
+/// than a thread that has already started answering peers.
+pub fn run(shared: &Shared, mut store: ChainStore, mut tree: HeaderTree) {
     let mut schedule = Schedule::new(shared);
     let mut received: u64 = 0;
     let mut reorg_depth: usize = 0;
+    let mut committed = Instant::now();
     publish(shared, &tree, &schedule, reorg_depth);
     while !shared.shutdown.is_begun() {
         match shared.to_chain.recv(CHAIN_TICK) {
@@ -84,9 +101,10 @@ pub fn run(shared: &Shared) {
             println!("bitmigo: reorg {depth} blocks deep, active chain rewinds past {fork}");
         }
         reorg_depth = depth;
+        commit(shared, &mut store, &mut tree, &mut committed);
         publish(shared, &tree, &schedule, reorg_depth);
     }
-    flush(shared);
+    flush(shared, &mut store, &mut tree);
     // Validation stops when the shutdown is announced, but closing the queue behind it says
     // so plainly: nothing further will be scheduled.
     shared.to_validation.close();
@@ -231,13 +249,39 @@ pub fn node_time() -> BlockTime {
     BlockTime::new(u32::try_from(seconds).unwrap_or(u32::MAX))
 }
 
+/// Commit the index when there is enough to commit, or when it has waited long enough.
+///
+/// A failure here is the disk saying no, and there is nothing useful to do with a block
+/// store that cannot be written to: the node says why and stops, rather than carrying on
+/// and losing the difference silently.
+fn commit(shared: &Shared, store: &mut ChainStore, tree: &mut HeaderTree, since: &mut Instant) {
+    let dirty = tree.dirty().len();
+    if dirty == 0 || (dirty < COMMIT_BATCH && since.elapsed() < COMMIT_INTERVAL) {
+        return;
+    }
+    match store.commit(tree) {
+        Ok(_) => *since = Instant::now(),
+        Err(error) => {
+            eprintln!("bitmigo: block index: {error}");
+            shared
+                .shutdown
+                .begin(Cause::Internal("the block index cannot be written"));
+        }
+    }
+}
+
 /// Get the block store and its index onto the disk before the process ends.
 ///
 /// The store's `fsync` goes here, in the order the storage engine states: files, then index.
 /// Doing it on a clean stop is what keeps crash recovery a backstop rather than the ordinary
-/// path — every Ctrl-C would otherwise replay every block since the last periodic flush.
-fn flush(shared: &Shared) {
+/// path — every Ctrl-C would otherwise replay every block since the last commit.
+fn flush(shared: &Shared, store: &mut ChainStore, tree: &mut HeaderTree) {
     let _ = shared;
+    match store.commit(tree) {
+        Ok(0) => {}
+        Ok(written) => println!("bitmigo: block index committed {written} entries"),
+        Err(error) => eprintln!("bitmigo: block index: {error}"),
+    }
 }
 
 #[cfg(test)]

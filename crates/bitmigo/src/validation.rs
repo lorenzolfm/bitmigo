@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use crate::runtime::Shared;
 use crate::runtime::queue::{ConnectJob, Received};
+use crate::store::UndoStore;
 
 /// How long the thread waits for a job before looking at the shutdown flag again.
 const VALIDATION_TICK: Duration = Duration::from_millis(250);
@@ -28,7 +29,7 @@ const VALIDATION_TICK: Duration = Duration::from_millis(250);
 /// and half of one must never reach the disk — and whatever else is queued is simply not
 /// started. Those blocks are still on the disk exactly as they arrived, and the next start
 /// picks them up from the tip.
-pub fn run(shared: &Shared) {
+pub fn run(shared: &Shared, mut store: UndoStore) {
     let mut connected: u64 = 0;
     while !shared.shutdown.is_begun() {
         match shared.to_validation.pop(VALIDATION_TICK) {
@@ -41,7 +42,7 @@ pub fn run(shared: &Shared) {
         }
     }
     let discarded = shared.to_validation.discard();
-    flush(shared);
+    flush(shared, &mut store);
     println!("bitmigo: validation stopped after {connected} blocks, {discarded} queued");
 }
 
@@ -67,8 +68,14 @@ fn apply(shared: &Shared, job: &ConnectJob) {
 /// for signals at all: the dirty coins, the tip, the accumulator and the marker that says
 /// they agree, written in the storage engine's order. A second signal cuts it short, and
 /// crash recovery pays for that in time.
-fn flush(shared: &Shared) {
+fn flush(shared: &Shared, store: &mut UndoStore) {
     let _ = shared;
+    // The undo series' one writer is this thread's, so this is the only place its bytes
+    // become durable. Nothing names them until the chain thread's index says so, which is
+    // why a failure here costs a re-connect and never a wrong answer.
+    if let Err(error) = store.undo.sync() {
+        eprintln!("bitmigo: undo: {error}");
+    }
 }
 
 #[cfg(test)]
@@ -109,11 +116,12 @@ mod tests {
 
     #[test]
     fn jobs_are_pulled_and_the_utxo_summary_follows_them() {
-        let shared = Arc::new(Shared::testing(Chain::Regtest));
+        let (shared, _chain, undo) = Shared::testing_store(Chain::Regtest);
+        let shared = Arc::new(shared);
         let running = Arc::clone(&shared);
         let validation = Builder::new()
             .name("validation".to_owned())
-            .spawn(move || run(&running))
+            .spawn(move || run(&running, undo))
             .expect("a test thread");
 
         for height in 1..=8 {
@@ -131,7 +139,8 @@ mod tests {
 
     #[test]
     fn a_shutdown_leaves_the_queued_blocks_for_the_next_start() {
-        let shared = Arc::new(Shared::testing(Chain::Regtest));
+        let (shared, _chain, undo) = Shared::testing_store(Chain::Regtest);
+        let shared = Arc::new(shared);
         // Announced before the thread starts, so nothing is taken off the queue at all.
         shared.shutdown.begin(Cause::Internal("test"));
         for height in 1..=4 {
@@ -141,7 +150,7 @@ mod tests {
         let running = Arc::clone(&shared);
         let validation = Builder::new()
             .name("validation".to_owned())
-            .spawn(move || run(&running))
+            .spawn(move || run(&running, undo))
             .expect("a test thread");
         validation.join().expect("the validation thread stops");
 

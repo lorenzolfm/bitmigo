@@ -3,11 +3,12 @@
 //! The chain thread: what it takes off the queue, what it puts in the snapshot, and what it
 //! does to a peer that sends it a header with no work behind it.
 
-use super::{fixture, node_time, run};
+use super::{HeaderTree, fixture, node_time, run};
 use crate::peer::{Disconnect, READER_THREAD_PREFIX, SlotIndex, SlotKind};
 use crate::runtime::Shared;
 use crate::runtime::queue::PeerMessage;
 use crate::runtime::signal::Cause;
+use crate::store::ChainStore;
 use bitcoin::block::Header;
 use bitcoin::p2p::message::NetworkMessage;
 use bitmigo_consensus::header::HeaderError;
@@ -18,11 +19,14 @@ use std::thread::{self, Builder};
 use std::time::{Duration, Instant};
 
 /// Run the chain thread under the name the supervisor gives it.
-fn spawn_chain(shared: &Arc<Shared>) -> thread::JoinHandle<()> {
+fn spawn_chain(shared: &Arc<Shared>, store: ChainStore) -> thread::JoinHandle<()> {
     let running = Arc::clone(shared);
+    // The startup thread loads the index and hands the tree over; these tests start from
+    // an empty store, so the tree they hand over is an empty one.
+    let tree = HeaderTree::new(&shared.params);
     Builder::new()
         .name("chain".to_owned())
-        .spawn(move || run(&running))
+        .spawn(move || run(&running, store, tree))
         .expect("a test thread")
 }
 
@@ -72,8 +76,9 @@ fn until(condition: impl Fn() -> bool) -> bool {
 
 #[test]
 fn the_chain_thread_drains_what_the_readers_send_it() {
-    let shared = Arc::new(Shared::testing(Chain::Regtest));
-    let chain = spawn_chain(&shared);
+    let (shared, store, _undo) = Shared::testing_store(Chain::Regtest);
+    let shared = Arc::new(shared);
+    let chain = spawn_chain(&shared, store);
 
     let sending = Arc::clone(&shared);
     let reader = Builder::new()
@@ -100,18 +105,20 @@ fn the_chain_thread_drains_what_the_readers_send_it() {
 
 #[test]
 fn the_operator_sees_the_peer_count_through_the_published_snapshot() {
-    let shared = Arc::new(Shared::testing(Chain::Regtest));
+    let (shared, store, _undo) = Shared::testing_store(Chain::Regtest);
+    let shared = Arc::new(shared);
     let (_index, _client) = connect_a_peer(&shared);
 
-    let chain = spawn_chain(&shared);
+    let chain = spawn_chain(&shared, store);
     assert!(until(|| shared.status.read().peers == 1));
     stop(&shared, chain);
 }
 
 #[test]
 fn the_published_snapshot_starts_at_the_chains_own_genesis() {
-    let shared = Arc::new(Shared::testing(Chain::Regtest));
-    let chain = spawn_chain(&shared);
+    let (shared, store, _undo) = Shared::testing_store(Chain::Regtest);
+    let shared = Arc::new(shared);
+    let chain = spawn_chain(&shared, store);
 
     let genesis = shared.params.genesis_hash();
     assert!(until(|| shared.status.read().tip == Some(genesis)));
@@ -127,9 +134,10 @@ fn the_published_snapshot_starts_at_the_chains_own_genesis() {
 
 #[test]
 fn headers_from_a_peer_advance_the_header_chain() {
-    let shared = Arc::new(Shared::testing(Chain::Regtest));
+    let (shared, store, _undo) = Shared::testing_store(Chain::Regtest);
+    let shared = Arc::new(shared);
     let (peer, _client) = connect_a_peer(&shared);
-    let chain = spawn_chain(&shared);
+    let chain = spawn_chain(&shared, store);
 
     let params = fixture::params();
     let headers = fixture::chain(&params.genesis().header, 12, 1, &params);
@@ -148,10 +156,11 @@ fn headers_from_a_peer_advance_the_header_chain() {
 
 #[test]
 fn a_header_with_no_work_behind_it_ends_the_connection() {
-    let shared = Arc::new(Shared::testing(Chain::Regtest));
+    let (shared, store, _undo) = Shared::testing_store(Chain::Regtest);
+    let shared = Arc::new(shared);
     let (peer, _client) = connect_a_peer(&shared);
     let connection = shared.slots.connection(peer).expect("a claimed slot");
-    let chain = spawn_chain(&shared);
+    let chain = spawn_chain(&shared, store);
 
     // A header whose hash is above the target it names: no work, so it never reaches the
     // tree at all, and the sender answers for it.
@@ -171,10 +180,11 @@ fn a_header_with_no_work_behind_it_ends_the_connection() {
 
 #[test]
 fn a_header_the_node_merely_cannot_place_costs_the_peer_nothing() {
-    let shared = Arc::new(Shared::testing(Chain::Regtest));
+    let (shared, store, _undo) = Shared::testing_store(Chain::Regtest);
+    let shared = Arc::new(shared);
     let (peer, _client) = connect_a_peer(&shared);
     let connection = shared.slots.connection(peer).expect("a claimed slot");
-    let chain = spawn_chain(&shared);
+    let chain = spawn_chain(&shared, store);
 
     // The second header of a chain, sent without the first: Core answers an unconnecting
     // header with a `getheaders` and no punishment (R4 §2.3), and so does this node.

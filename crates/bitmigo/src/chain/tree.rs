@@ -133,8 +133,12 @@ impl NodeId {
         NodeId(index)
     }
 
-    /// Its arena position.
-    fn position(self) -> usize {
+    /// Its arena position: dense from zero, in the order the headers entered the tree.
+    ///
+    /// Public so that a pass over the whole tree can keep a table beside it as a `Vec`
+    /// rather than a map keyed by hash — the block index's load is one (BM-26).
+    #[must_use]
+    pub fn position(self) -> usize {
         usize::try_from(self.0).expect("a u32 index fits a usize")
     }
 }
@@ -158,6 +162,66 @@ pub struct UndoLocation {
     pub offset: u32,
     /// How many bytes it is.
     pub len: u32,
+}
+
+/// Which of the pipeline's stages refused a block, with the evidence left behind.
+///
+/// The block index keeps one of these and not the error itself (BM-26): a header-stage
+/// refusal is re-derived exactly by a replay, and for the four that need the block, what
+/// has to survive a restart is that the block is never built on again. That is a byte,
+/// against a codec for four error enums whose whole job is to produce a line of text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// `accept_header`.
+    AcceptHeader,
+    /// `check_block`.
+    CheckBlock,
+    /// `accept_block`.
+    AcceptBlock,
+    /// `confirm`.
+    Confirm,
+    /// `connect`.
+    Connect,
+}
+
+impl Stage {
+    /// The byte the index writes. Stated rather than derived from the variant order, so
+    /// that adding a stage cannot silently renumber a file already on somebody's disk.
+    #[must_use]
+    pub fn tag(self) -> u8 {
+        match self {
+            Stage::AcceptHeader => 1,
+            Stage::CheckBlock => 2,
+            Stage::AcceptBlock => 3,
+            Stage::Confirm => 4,
+            Stage::Connect => 5,
+        }
+    }
+
+    /// The stage a byte names, or nothing.
+    #[must_use]
+    pub fn of_tag(tag: u8) -> Option<Stage> {
+        match tag {
+            1 => Some(Stage::AcceptHeader),
+            2 => Some(Stage::CheckBlock),
+            3 => Some(Stage::AcceptBlock),
+            4 => Some(Stage::Confirm),
+            5 => Some(Stage::Connect),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Stage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Stage::AcceptHeader => "accept_header",
+            Stage::CheckBlock => "check_block",
+            Stage::AcceptBlock => "accept_block",
+            Stage::Confirm => "confirm",
+            Stage::Connect => "connect",
+        })
+    }
 }
 
 /// Which of the pipeline's stages refused a block, and what it said.
@@ -185,6 +249,28 @@ pub enum Invalidity {
     Confirm(ConfirmError),
     /// `connect` refused it: an input's scripts did not verify.
     Connect(ConnectError),
+    /// A verdict this node reached in an earlier run and wrote to the block index. The
+    /// evidence went to the log when it happened; what came back is the stage, which is
+    /// what keeps the block off the chain (BM-26).
+    Reloaded {
+        /// The stage that refused it, that run.
+        stage: Stage,
+    },
+}
+
+impl Invalidity {
+    /// Which stage this is, which is all the block index keeps.
+    #[must_use]
+    pub fn stage(self) -> Stage {
+        match self {
+            Invalidity::AcceptHeader(_) => Stage::AcceptHeader,
+            Invalidity::CheckBlock(_) => Stage::CheckBlock,
+            Invalidity::AcceptBlock(_) => Stage::AcceptBlock,
+            Invalidity::Confirm(_) => Stage::Confirm,
+            Invalidity::Connect(_) => Stage::Connect,
+            Invalidity::Reloaded { stage } => stage,
+        }
+    }
 }
 
 impl fmt::Display for Invalidity {
@@ -195,6 +281,9 @@ impl fmt::Display for Invalidity {
             Invalidity::AcceptBlock(error) => write!(formatter, "accept_block: {error}"),
             Invalidity::Confirm(error) => write!(formatter, "confirm: {error}"),
             Invalidity::Connect(error) => write!(formatter, "connect: {error}"),
+            Invalidity::Reloaded { stage } => {
+                write!(formatter, "{stage} refused it in an earlier run")
+            }
         }
     }
 }
@@ -297,12 +386,15 @@ pub struct HeaderEntry {
     parent: Option<NodeId>,
     skip: Option<NodeId>,
     status: HeaderStatus,
+    /// Changed since the block index last had it. The flag is what keeps one entry to one
+    /// place in [`HeaderTree::dirty`], however many times it changes between two commits.
+    dirty: bool,
 }
 
 impl HeaderEntry {
-    /// The header itself, which is what a `headers` message is made of.
+    /// The header itself, which is what a `headers` message is made of, and what the
+    /// block index writes down.
     #[must_use]
-    #[allow(dead_code, reason = "the block server serves these: BM-24")]
     pub fn header(&self) -> &Header {
         &self.header
     }
@@ -467,6 +559,9 @@ pub struct HeaderTree {
     index: HashMap<BlockHash, NodeId>,
     tip: NodeId,
     best_header: NodeId,
+    /// Entries the block index has not been told about yet, in the order they first
+    /// changed. Bounded by the tree, because an entry appears at most once.
+    dirty: Vec<NodeId>,
     /// Scratch for [`next_required_bits`], reused so that assembling a context allocates
     /// nothing. Bounded by the difficulty adjustment interval.
     period: Vec<HeaderFacts>,
@@ -501,6 +596,9 @@ impl HeaderTree {
             parent: None,
             skip: None,
             status: HeaderStatus::Genesis,
+            // Genesis comes from the chain parameters at every start, so it is never
+            // written down and never dirty.
+            dirty: false,
         };
         let mut index = HashMap::with_capacity(1024);
         index.insert(hash, NodeId::GENESIS);
@@ -509,6 +607,7 @@ impl HeaderTree {
             index,
             tip: NodeId::GENESIS,
             best_header: NodeId::GENESIS,
+            dirty: Vec::new(),
             period: Vec::with_capacity(usize::try_from(interval).expect("an interval fits")),
             cap,
         }
@@ -713,7 +812,10 @@ impl HeaderTree {
             parent: Some(parent),
             skip,
             status,
+            // Every entry the tree gains is an entry the index has not got.
+            dirty: true,
         });
+        self.dirty.push(node);
         let seen = self.index.insert(hash, node);
         assert!(
             seen.is_none(),
@@ -830,6 +932,7 @@ impl HeaderTree {
             "{node} is {status:?}, so its bytes were written twice",
         );
         self.entry_mut(node).status = HeaderStatus::BlockChecked { location };
+        self.mark_dirty(node);
     }
 
     /// The block's coins are in the chainstate and its undo record is written.
@@ -848,6 +951,7 @@ impl HeaderTree {
             panic!("{node} is {status:?}, and only a checked block connects")
         };
         self.entry_mut(node).status = HeaderStatus::Connected { location, undo };
+        self.mark_dirty(node);
         self.tip = node;
     }
 
@@ -864,6 +968,7 @@ impl HeaderTree {
             .parent
             .expect("genesis is never the block disconnected");
         self.entry_mut(node).status = HeaderStatus::BlockChecked { location };
+        self.mark_dirty(node);
         self.tip = parent;
     }
 
@@ -877,6 +982,9 @@ impl HeaderTree {
             "{node} is on the active chain: a reorg takes it off before it is refused",
         );
         self.entry_mut(node).status = HeaderStatus::Invalid { invalidity };
+        self.mark_dirty(node);
+        // The descendants are not marked: an inherited verdict is written down as what the
+        // entry was before it, because a replay re-derives the inheritance for itself.
         self.propagate_and_reselect(node);
     }
 
@@ -919,6 +1027,39 @@ impl HeaderTree {
             "the active chain cannot descend from an invalid block",
         );
         self.entry_mut(node).status = HeaderStatus::InvalidAncestor { culprit };
+    }
+
+    /// Note that this entry has changed since the block index last saw it.
+    ///
+    /// Marked once however often it changes between two commits, and in the order it first
+    /// changed — which is parents before children, because an entry is marked as it is
+    /// inserted and a child is inserted after its parent.
+    fn mark_dirty(&mut self, node: NodeId) {
+        if self.entry(node).dirty {
+            return;
+        }
+        self.entry_mut(node).dirty = true;
+        self.dirty.push(node);
+        assert!(
+            self.dirty.len() <= self.entries.len(),
+            "an entry is marked once",
+        );
+    }
+
+    /// What the block index has not been told about yet.
+    pub fn dirty(&self) -> &[NodeId] {
+        &self.dirty
+    }
+
+    /// The index has them. Called only after the batch is durable, so that a failed write
+    /// leaves every mark where it was.
+    pub fn clear_dirty(&mut self) {
+        for position in 0..self.dirty.len() {
+            if let Some(node) = self.dirty.get(position).copied() {
+                self.entry_mut(node).dirty = false;
+            }
+        }
+        self.dirty.clear();
     }
 
     /// Every node, in the order they entered the tree — which is parents before children.

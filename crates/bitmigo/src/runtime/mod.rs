@@ -40,7 +40,7 @@ pub mod sync;
 
 use std::io;
 use std::net::{SocketAddr, TcpListener};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,6 +55,7 @@ use crate::runtime::queue::{ChainToValidation, PeerMessage, PeerToChain};
 use crate::runtime::signal::{Cause, Shutdown, SignalPipe};
 use crate::runtime::snapshot::{Published, StatusSnapshot, UtxoSetSnapshot};
 use crate::runtime::supervisor::{DEFAULT_STACK_BYTES, ShutdownReport, Supervisor};
+use crate::store::{ChainStore, DataDir, Store, UndoStore};
 use crate::{chain, control, peer, validation};
 
 /// The thread that accepts connections, and the one that owns the self-pipe.
@@ -186,6 +187,35 @@ pub fn params_for(chain: Chain) -> ChainParams {
     }
 }
 
+/// Take the data directory's lock, open the store, and replay the block index into a tree.
+///
+/// All of it before any thread exists and before the socket is bound: a directory another
+/// bitmigo holds, or a store this one cannot read, must stop the node while it is still
+/// one thread that can say why.
+///
+/// The marker is genesis until there is a coin store (BM-27), and that is exactly right:
+/// an empty UTXO set corresponds to the block before any coin existed, so every
+/// `Connected` entry is demoted and every block is connected again — BM-D4's load rule
+/// with the one term it has so far.
+fn open_store(
+    config: &Config,
+    params: &ChainParams,
+) -> io::Result<(Store, ChainStore, UndoStore, chain::HeaderTree)> {
+    let network = Network::of(params);
+    let directory = DataDir::open(&config.data_dir, network.directory())?;
+    let (store, mut chain_store, undo_store) = Store::open(directory, params)?;
+
+    let mut tree = chain::HeaderTree::new(params);
+    let loaded =
+        chain_store
+            .index
+            .load(&mut tree, params, chain::node_time(), params.genesis_hash())?;
+    if loaded.records > 0 {
+        println!("bitmigo: block index: {loaded}");
+    }
+    Ok((store, chain_store, undo_store, tree))
+}
+
 /// What the threads share. Everything here is either a bounded queue, a published snapshot,
 /// or the slot table: there is no shared mutable node state, because each owner keeps its own
 /// behind its own thread.
@@ -201,6 +231,14 @@ pub struct Shared {
     pub slots: PeerSlots,
     /// Where to dial next, and the anchors from the last clean stop.
     pub candidates: Candidates,
+    /// The locked data directory, and read access to the blocks and their undo records.
+    /// Both writers are elsewhere: one per thread that owns one.
+    #[allow(
+        dead_code,
+        reason = "read by the peer writers serving blocks (BM-24) and by the connect and \
+                  disconnect paths (BM-10); holding it here is also what holds the lock"
+    )]
+    pub store: Store,
     /// Peer readers to the chain thread. The only queue with a blocking send.
     pub to_chain: PeerToChain<PeerMessage>,
     /// The chain thread to the validation thread. Pulled, never pushed against a full queue.
@@ -212,14 +250,15 @@ pub struct Shared {
 }
 
 impl Shared {
-    /// The shared state of a node that has just started.
-    pub fn new(params: ChainParams, data_dir: &Path) -> Shared {
+    /// The shared state of a node that has just started, around a store already open.
+    pub fn new(params: ChainParams, store: Store) -> Shared {
         let network = Network::of(&params);
         let chain = params.chain();
-        let directory = data_dir.join(network.directory());
+        let candidates = Candidates::new(&network, store.directory().root());
         Shared {
             shutdown: Shutdown::new(),
-            candidates: Candidates::new(&network, &directory),
+            candidates,
+            store,
             params,
             network,
             slots: PeerSlots::new(),
@@ -233,12 +272,19 @@ impl Shared {
 
 #[cfg(test)]
 impl Shared {
-    /// Shared state for a test, on a chain and a data directory outside the source tree.
+    /// Shared state for a test, in a data directory of its own that goes away with it.
     pub fn testing(chain: Chain) -> Shared {
-        Shared::new(
-            params_for(chain),
-            &std::env::temp_dir().join("bitmigo-tests"),
-        )
+        let (shared, _, _) = Shared::testing_store(chain);
+        shared
+    }
+
+    /// The same, keeping the two writers for a test that wants to write.
+    pub fn testing_store(chain: Chain) -> (Shared, ChainStore, UndoStore) {
+        let params = params_for(chain);
+        let directory = DataDir::transient().expect("a test data directory");
+        let (store, chain_store, undo_store) =
+            Store::open(directory, &params).expect("an empty store opens");
+        (Shared::new(params, store), chain_store, undo_store)
     }
 }
 
@@ -261,13 +307,18 @@ impl Runtime {
             THREAD_COUNT,
             "the table is the thread count",
         );
+        // Before the socket: two bitmigos on one data directory would corrupt the store,
+        // and the one that loses should say so rather than start listening first.
+        let params = params_for(config.chain);
+        let (store, chain_store, undo_store, tree) = open_store(config, &params)?;
+
         let socket = TcpListener::bind(config.listen)?;
         let listen = socket.local_addr()?;
         // Said here rather than by the caller, and before a thread exists: a peer can
         // connect the instant the listener starts, and a node whose first line is a peer's
         // arrival is a node nothing can tell where it is listening.
         println!("bitmigo: listening on {listen}, {THREAD_COUNT} threads");
-        let shared = Arc::new(Shared::new(params_for(config.chain), &config.data_dir));
+        let shared = Arc::new(Shared::new(params, store));
         for peer in &config.peers {
             // Offered rather than dialled here: the connector owns dialling, and it applies
             // the netgroup rule to these exactly as to anything else.
@@ -305,13 +356,16 @@ impl Runtime {
             )?;
         }
 
+        // The two writers leave here and are never seen again: the chain thread owns the
+        // block series and the index, validation owns the undo series, and neither has a
+        // second handle anywhere in the process.
         let charting = Arc::clone(&shared);
         supervisor.spawn(CHAIN_THREAD, DEFAULT_STACK_BYTES, move || {
-            chain::run(&charting);
+            chain::run(&charting, chain_store, tree);
         })?;
         let validating = Arc::clone(&shared);
         supervisor.spawn(VALIDATION_THREAD, DEFAULT_STACK_BYTES, move || {
-            validation::run(&validating);
+            validation::run(&validating, undo_store);
         })?;
         let answering = Arc::clone(&shared);
         supervisor.spawn(CONTROL_THREAD, DEFAULT_STACK_BYTES, move || {

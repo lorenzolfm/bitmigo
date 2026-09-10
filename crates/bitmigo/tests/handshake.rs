@@ -7,6 +7,10 @@
 //! thread framing what arrives, the handshake, and a writer thread getting the answer back
 //! out — against the binary an operator would run.
 
+mod common;
+
+use common::DataDir;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -28,9 +32,10 @@ const PROTOCOL_VERSION: u32 = 70_016;
 const REPLY_LIMIT: Duration = Duration::from_secs(10);
 
 /// Start the node on a port the operating system picks, and wait until it says where.
-fn start() -> (Child, BufReader<ChildStdout>, SocketAddr) {
+fn start(data: &DataDir) -> (Child, BufReader<ChildStdout>, SocketAddr) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_bitmigo"))
         .arg("127.0.0.1:0")
+        .env("XDG_DATA_HOME", data.path())
         .stdout(Stdio::piped())
         .spawn()
         .expect("the node starts");
@@ -122,7 +127,8 @@ fn version() -> NetworkMessage {
 /// session decided, and the writer wrote.
 #[test]
 fn the_node_completes_a_handshake_and_answers_a_ping() {
-    let (mut child, _lines, address) = start();
+    let data = DataDir::new();
+    let (mut child, _lines, address) = start(&data);
     let mut peer = Peer::connect(address);
 
     peer.send(version());
@@ -156,7 +162,8 @@ fn the_node_completes_a_handshake_and_answers_a_ping() {
 /// The socket closing is how a test sees a verdict the node reached on its own thread.
 #[test]
 fn a_mempool_request_ends_the_connection() {
-    let (mut child, mut lines, address) = start();
+    let data = DataDir::new();
+    let (mut child, mut lines, address) = start(&data);
     let mut peer = Peer::connect(address);
 
     peer.send(version());
@@ -181,7 +188,8 @@ fn a_mempool_request_ends_the_connection() {
 /// exists so a peer cannot pick this node's buffer size.
 #[test]
 fn a_message_for_another_network_is_refused() {
-    let (mut child, mut lines, address) = start();
+    let data = DataDir::new();
+    let (mut child, mut lines, address) = start(&data);
     let mut peer = Peer::connect(address);
     peer.stream
         .write_all(&serialize(&RawNetworkMessage::new(
@@ -206,8 +214,12 @@ fn a_message_for_another_network_is_refused() {
 /// the side that speaks first.
 #[test]
 fn a_node_dials_the_peer_it_was_pointed_at() {
-    let (mut listening, mut listening_says, address) = start();
-    let (mut dialling, mut dialling_says, _address) = start_dialling(address);
+    // Two nodes, and so two data directories: each takes the lock on its own store, which
+    // is the rule this pair would otherwise be the first thing to break.
+    let data = DataDir::new();
+    let dialling_data = DataDir::new();
+    let (mut listening, mut listening_says, address) = start(&data);
+    let (mut dialling, mut dialling_says, _address) = start_dialling(&dialling_data, address);
 
     let dialled = waits_for(&mut dialling_says, "ready:").expect("the dialling node's line");
     assert!(dialled.contains("/bitmigo:"), "{dialled:?}");
@@ -218,10 +230,11 @@ fn a_node_dials_the_peer_it_was_pointed_at() {
 }
 
 /// A node told where one other node is, which is bitcoind's `-addnode`.
-fn start_dialling(peer: SocketAddr) -> (Child, BufReader<ChildStdout>, SocketAddr) {
+fn start_dialling(data: &DataDir, peer: SocketAddr) -> (Child, BufReader<ChildStdout>, SocketAddr) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_bitmigo"))
         .arg("127.0.0.1:0")
         .arg(peer.to_string())
+        .env("XDG_DATA_HOME", data.path())
         .stdout(Stdio::piped())
         .spawn()
         .expect("the node starts");

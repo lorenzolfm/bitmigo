@@ -23,6 +23,7 @@ mod control;
 mod download;
 mod peer;
 mod runtime;
+mod store;
 mod validation;
 
 use std::io;

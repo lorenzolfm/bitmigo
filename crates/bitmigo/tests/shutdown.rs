@@ -7,6 +7,10 @@
 //! process boundary owns: that a handler reaches every thread, and that a second signal
 //! leaves at once.
 
+mod common;
+
+use common::DataDir;
+
 use std::io::{BufRead, BufReader, Read};
 use std::net::{SocketAddr, TcpStream};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -24,9 +28,10 @@ const EXIT_SECOND_SIGNAL: i32 = 2;
 const STOP_LIMIT: Duration = Duration::from_secs(20);
 
 /// Start the node on a port the operating system picks, and wait until it says where.
-fn start() -> (Child, BufReader<ChildStdout>, SocketAddr) {
+fn start(data: &DataDir) -> (Child, BufReader<ChildStdout>, SocketAddr) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_bitmigo"))
         .arg("127.0.0.1:0")
+        .env("XDG_DATA_HOME", data.path())
         .stdout(Stdio::piped())
         .spawn()
         .expect("the node starts");
@@ -73,7 +78,8 @@ fn wait(child: &mut Child) -> Option<i32> {
 
 #[test]
 fn sigint_stops_a_node_with_a_peer_blocked_in_a_read() {
-    let (mut child, mut lines, address) = start();
+    let data = DataDir::new();
+    let (mut child, mut lines, address) = start(&data);
 
     // A peer that connects and then says nothing at all: its reader thread is inside a
     // blocking read, which is the state the shutdown has to be able to end.
@@ -118,7 +124,8 @@ fn sigint_stops_a_node_with_a_peer_blocked_in_a_read() {
 
 #[test]
 fn sigterm_stops_it_too() {
-    let (mut child, mut lines, _address) = start();
+    let data = DataDir::new();
+    let (mut child, mut lines, _address) = start(&data);
     signal(&child, libc::SIGTERM);
     assert_eq!(wait(&mut child), Some(0));
 
@@ -133,7 +140,8 @@ fn sigterm_stops_it_too() {
 
 #[test]
 fn a_second_signal_leaves_at_once() {
-    let (mut child, _lines, address) = start();
+    let data = DataDir::new();
+    let (mut child, _lines, address) = start(&data);
 
     // A full inbound table, so the shutdown has thirty-two sockets and sixty-four threads to
     // get through rather than none: this is the long stop the escape hatch exists for.
